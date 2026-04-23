@@ -1,0 +1,67 @@
+# ─── Secrets ─────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+credentials.json
+token.pickle
+token.json
+*.pem
+*.key
+service-account*.json
+
+# ─── Data (never commit real contacts) ───────────────────────
+extracted_contacts_database.csv
+extracted_contacts_*.csv
+/data/
+leads.csv
+Sheet1.csv
+Sheet2.csv
+
+# ─── Build artefacts ─────────────────────────────────────────
+*.apk
+*.aab
+/android-app/build/
+/android-app/.gradle/
+*.class
+*.jar
+target/
+
+# ─── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ─── Node / Extension dev ────────────────────────────────────
+node_modules/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp.*
+.parcel-cache/
+dist/
+build/
+
+# ─── Apps Script (clasp) ─────────────────────────────────────
+.clasp.json
+.clasprc.json
+.claspignore
+
+# ─── OS / Editor ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.iml
+
+# ─── Private masking utility (not part of the public repo) ───
+.mask_and_copy.py
+
+# ─── Claude Code local settings ──────────────────────────────
+.claude/
