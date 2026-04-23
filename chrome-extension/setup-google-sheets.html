@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google Sheets Setup Guide - LinkedIn Agent</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #0077b5;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        h2 {
+            color: #0077b5;
+            margin-top: 30px;
+            margin-bottom: 15px;
+        }
+        .step {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid #0077b5;
+        }
+        .step h3 {
+            margin-top: 0;
+            color: #0077b5;
+        }
+        .code {
+            background: #f4f4f4;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: monospace;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+        }
+        .highlight {
+            background: #fff3cd;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #ffeaa7;
+            margin: 15px 0;
+        }
+        .success {
+            background: #d4edda;
+            color: #155724;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #c3e6cb;
+            margin: 15px 0;
+        }
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #f5c6cb;
+            margin: 15px 0;
+        }
+        .warning {
+            background: #fff3cd;
+            color: #856404;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #ffeaa7;
+            margin: 15px 0;
+        }
+        ol {
+            padding-left: 20px;
+        }
+        li {
+            margin: 10px 0;
+        }
+        .button {
+            background: #0077b5;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin: 10px 0;
+        }
+        .button:hover {
+            background: #005885;
+        }
+        .pre-configured {
+            background: #e8f5e8;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #c3e6cb;
+            margin: 15px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 Google Sheets Setup Guide</h1>
+        <p>This guide will help you configure the LinkedIn Agent to automatically export extracted profile data to Google Sheets.</p>
+
+        <div class="pre-configured">
+            <h3>✅ Fully Pre-configured and Ready to Use!</h3>
+            <p>Your extension is already set up with:</p>
+            <ul>
+                <li><strong>API Key:</strong> ✅ Pre-configured</li>
+                <li><strong>Spreadsheet:</strong> <code>YOUR_GOOGLE_SHEET_ID</code></li>
+                <li><strong>Sheet Name:</strong> <code>Sheet1</code></li>
+            </ul>
+            <p><strong>Direct Link:</strong></p>
+            <div class="code">https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit</div>
+        </div>
+
+        <div class="success">
+            <h3>🚀 Quick Start (No Setup Required!)</h3>
+            <ol>
+                <li>Make sure your Google Sheet is accessible (shared with "Anyone with the link can edit")</li>
+                <li>Open the extension popup and go to "Settings" tab</li>
+                <li>The configuration should already be filled in and enabled</li>
+                <li>Go to any LinkedIn profile and click "Extract Profile Data"</li>
+                <li>Check your Google Sheet - data should appear automatically!</li>
+            </ol>
+        </div>
+
+        <div class="step">
+            <h3>Step 1: Get Google Sheets API Key</h3>
+            <ol>
+                <li>Go to the <a href="https://console.cloud.google.com/" target="_blank">Google Cloud Console</a></li>
+                <li>Create a new project or select an existing one</li>
+                <li>Enable the Google Sheets API:
+                    <ul>
+                        <li>Go to "APIs & Services" → "Library"</li>
+                        <li>Search for "Google Sheets API"</li>
+                        <li>Click on it and press "Enable"</li>
+                    </ul>
+                </li>
+                <li>Create credentials:
+                    <ul>
+                        <li>Go to "APIs & Services" → "Credentials"</li>
+                        <li>Click "Create Credentials" → "API Key"</li>
+                        <li>Copy the generated API key</li>
+                    </ul>
+                </li>
+                <li>Configure API key restrictions (recommended):
+                    <ul>
+                        <li>Click on your API key to edit it</li>
+                        <li>Under "API restrictions", select "Restrict key"</li>
+                        <li>Choose "Google Sheets API" from the dropdown</li>
+                        <li>Save the changes</li>
+                    </ul>
+                </li>
+            </ol>
+        </div>
+
+        <div class="step">
+            <h3>Step 2: Configure Google Sheets Permissions</h3>
+            <ol>
+                <li>Open your Google Sheets document</li>
+                <li>Click the "Share" button in the top right</li>
+                <li>Change the access to "Anyone with the link can edit" or "Anyone with the link can view"</li>
+                <li>Copy the sharing link (you already have this)</li>
+            </ol>
+            <div class="warning">
+                <strong>Important:</strong> The sheet must be publicly accessible for the API key to work. If you want to keep it private, you'll need to use OAuth2 authentication instead.
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>Step 3: Configure the Extension</h3>
+            <ol>
+                <li>Open the LinkedIn Agent extension popup</li>
+                <li>Click on the "Settings" tab</li>
+                <li>Enable "Google Sheets Integration"</li>
+                <li>Enter the following configuration:
+                    <ul>
+                        <li><strong>API Key:</strong> Your Google Sheets API key from Step 1</li>
+                        <li><strong>Spreadsheet ID:</strong> <code>YOUR_GOOGLE_SHEET_ID</code></li>
+                        <li><strong>Sheet Name:</strong> <code>Sheet1</code> (or your preferred sheet name)</li>
+                    </ul>
+                </li>
+                <li>Click "Save Configuration"</li>
+            </ol>
+        </div>
+
+        <div class="step">
+            <h3>Step 4: Test the Integration</h3>
+            <ol>
+                <li>Navigate to any LinkedIn profile page</li>
+                <li>Click the extension icon</li>
+                <li>Click "Extract Profile Data"</li>
+                <li>Check your Google Sheets document for the extracted data</li>
+            </ol>
+        </div>
+
+        <h2>📊 Data Format</h2>
+        <p>The extension will automatically add the following columns to your Google Sheet:</p>
+        <div class="code">
+            Timestamp | Full Name | Current Position | Current Company | Headline | Email | Profile URL | Confidence | Location | Connections | About
+        </div>
+
+        <h2>🔧 Troubleshooting</h2>
+        
+        <div class="error">
+            <h3>❌ Common Issues</h3>
+            <ul>
+                <li><strong>API Key Error:</strong> Make sure your API key is valid and has access to Google Sheets API</li>
+                <li><strong>Permission Error:</strong> Ensure the Google Sheet is publicly accessible</li>
+                <li><strong>Sheet Not Found:</strong> Check that the sheet name matches exactly</li>
+                <li><strong>Quota Exceeded:</strong> Google Sheets API has daily limits</li>
+            </ul>
+        </div>
+
+        <div class="success">
+            <h3>✅ Success Indicators</h3>
+            <ul>
+                <li>Extension popup shows "📊 Google Sheets: Data exported automatically"</li>
+                <li>New rows appear in your Google Sheet after extraction</li>
+                <li>Browser console shows "✅ Successfully sent data to Google Sheets"</li>
+            </ul>
+        </div>
+
+        <h2>🔒 Security Notes</h2>
+        <div class="warning">
+            <ul>
+                <li>Keep your API key secure and never share it publicly</li>
+                <li>Consider using IP restrictions on your API key</li>
+                <li>Regularly rotate your API keys</li>
+                <li>Monitor your Google Cloud usage for unexpected activity</li>
+            </ul>
+        </div>
+
+        <h2>🚀 Enhanced Features</h2>
+        
+        <div class="step">
+            <h3>📊 Comprehensive Data Extraction</h3>
+            <p>The extension now extracts extensive profile intelligence for strategic outreach:</p>
+            <div class="code">
+                <strong>Basic Profile Data:</strong><br>
+                Name, Position, Company, Headline, Email, URL, Confidence, Location, Connections, About<br><br>
+                
+                <strong>Strategic Intelligence:</strong><br>
+                • Recruiter Detection & Focus Areas<br>
+                • Recent Activity Analysis<br>
+                • Email Pattern Generation<br>
+                • Mutual Connection Count<br>
+                • Education Background<br>
+                • Top Skills Extraction
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>💬 P.R.E.P Framework Messages</h3>
+            <p>Automatically generates strategic outreach messages using the proven P.R.E.P framework:</p>
+            <ul>
+                <li><strong>P</strong>ersonal Hook - References specific content/activity from profile</li>
+                <li><strong>R</strong>elevance Statement - Shows professional fit in one sentence</li>
+                <li><strong>E</strong>evidence Burst - Provides specific achievement with metrics</li>
+                <li><strong>P</strong>olite CTA - Creates low-friction call-to-action</li>
+            </ul>
+            <div class="success">
+                <strong>Generated Messages Include:</strong>
+                <ul>
+                    <li>LinkedIn Connection Request (300 char limit)</li>
+                    <li>Professional Email Subject Line</li>
+                    <li>Strategic Email Body</li>
+                    <li>Personalization Summary</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>🎯 Strategic Personalization</h3>
+            <p>The system analyzes profiles for multiple personalization opportunities:</p>
+            <ul>
+                <li><strong>Activity-Based:</strong> Recent posts, achievements, hiring activity</li>
+                <li><strong>Connection-Based:</strong> Mutual connections, shared experiences</li>
+                <li><strong>Role-Based:</strong> Recruiter detection, hiring focus identification</li>
+                <li><strong>Background-Based:</strong> Education, skills, company details</li>
+            </ul>
+        </div>
+
+        <h2>📞 Support</h2>
+        <p>If you encounter issues:</p>
+        <ol>
+            <li>Check the browser console for error messages</li>
+            <li>Verify your API key and permissions</li>
+            <li>Test with a simple public Google Sheet first</li>
+            <li>Ensure you're on a LinkedIn profile page (linkedin.com/in/username)</li>
+        </ol>
+
+        <div class="highlight">
+            <h3>💡 Pro Tips</h3>
+            <ul>
+                <li>Create a dedicated Google Cloud project for this integration</li>
+                <li>Use a separate Google Sheet for testing</li>
+                <li>Set up monitoring for API usage</li>
+                <li>Consider using Google Apps Script for advanced automation</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html> 

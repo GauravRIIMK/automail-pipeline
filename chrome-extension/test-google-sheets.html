@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google Sheets Integration Test</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #0077b5;
+            text-align: center;
+        }
+        .test-section {
+            margin: 20px 0;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #0077b5;
+        }
+        .button {
+            background: #0077b5;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px 5px;
+        }
+        .button:hover {
+            background: #005885;
+        }
+        .button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .result {
+            margin: 15px 0;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+        .success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .config-display {
+            background: #f4f4f4;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 15px 0;
+        }
+        .code {
+            background: #f4f4f4;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: monospace;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 Google Sheets Integration Test</h1>
+        
+        <div class="test-section">
+            <h3>Configuration</h3>
+            <div id="configDisplay" class="config-display">
+                <strong>API Key:</strong> YOUR_GEMINI_API_KEY<br>
+                <strong>Spreadsheet ID:</strong> YOUR_GOOGLE_SHEET_ID<br>
+                <strong>Sheet Name:</strong> LinkedIn Profiles<br>
+                <strong>Enabled:</strong> <span id="enabledStatus">Checking...</span>
+            </div>
+        </div>
+
+        <div class="test-section">
+            <h3>Test Connection</h3>
+            <button id="testConnection" class="button">Test Google Sheets Connection</button>
+            <div id="connectionResult" class="result" style="display: none;"></div>
+        </div>
+
+        <div class="test-section">
+            <h3>Test Data Upload</h3>
+            <button id="testUpload" class="button">Send Test Data to Google Sheets</button>
+            <div id="uploadResult" class="result" style="display: none;"></div>
+        </div>
+
+        <div class="test-section">
+            <h3>View Your Google Sheet</h3>
+            <p>Click the link below to view your Google Sheets document:</p>
+            <a href="https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit" target="_blank" class="button">Open Google Sheet</a>
+        </div>
+
+        <div class="test-section">
+            <h3>Instructions</h3>
+            <ol>
+                <li>Make sure your Google Sheet is shared with "Anyone with the link can edit"</li>
+                <li>Click "Test Google Sheets Connection" to verify the API key works</li>
+                <li>Click "Send Test Data to Google Sheets" to test data upload</li>
+                <li>Check your Google Sheet to see if the test data appears</li>
+            </ol>
+        </div>
+
+        <div class="test-section">
+            <h3>Expected Google Sheets Format</h3>
+            <div class="code">
+                Timestamp | Full Name | Current Position | Current Company | Headline | Email | Profile URL | Confidence | Location | Connections | About
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const config = {
+            apiKey: 'YOUR_GEMINI_API_KEY',
+            spreadsheetId: 'YOUR_GOOGLE_SHEET_ID',
+            sheetName: 'LinkedIn Profiles'
+        };
+
+        // Test connection
+        document.getElementById('testConnection').addEventListener('click', async () => {
+            const button = document.getElementById('testConnection');
+            const result = document.getElementById('connectionResult');
+            
+            button.disabled = true;
+            button.textContent = 'Testing...';
+            result.style.display = 'block';
+            result.className = 'result info';
+            result.textContent = 'Testing connection to Google Sheets...';
+
+            try {
+                const url = `https://sheets.googleapis.com/v4/spreadsheets/${config.spreadsheetId}/values/${encodeURIComponent(config.sheetName)}!A1:K1?key=${config.apiKey}`;
+                
+                const response = await fetch(url);
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    result.className = 'result success';
+                    result.textContent = `✅ Connection successful!\n\nResponse: ${JSON.stringify(data, null, 2)}`;
+                } else {
+                    const errorData = await response.json().catch(() => ({}));
+                    result.className = 'result error';
+                    result.textContent = `❌ Connection failed!\n\nStatus: ${response.status} ${response.statusText}\nError: ${JSON.stringify(errorData, null, 2)}`;
+                }
+            } catch (error) {
+                result.className = 'result error';
+                result.textContent = `❌ Connection error!\n\nError: ${error.message}`;
+            }
+
+            button.disabled = false;
+            button.textContent = 'Test Google Sheets Connection';
+        });
+
+        // Test data upload
+        document.getElementById('testUpload').addEventListener('click', async () => {
+            const button = document.getElementById('testUpload');
+            const result = document.getElementById('uploadResult');
+            
+            button.disabled = true;
+            button.textContent = 'Uploading...';
+            result.style.display = 'block';
+            result.className = 'result info';
+            result.textContent = 'Sending test data to Google Sheets...';
+
+            try {
+                const testData = [
+                    new Date().toISOString(),
+                    'Test User',
+                    'Test Position',
+                    'Test Company',
+                    'Test Headline',
+                    'test@example.com',
+                    'https://linkedin.com/in/test',
+                    '95%',
+                    'Test Location',
+                    '500+',
+                    'Test about section'
+                ];
+
+                const url = `https://sheets.googleapis.com/v4/spreadsheets/${config.spreadsheetId}/values/${encodeURIComponent(config.sheetName)}:append?valueInputOption=USER_ENTERED&key=${config.apiKey}`;
+                
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        values: [testData]
+                    })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    result.className = 'result success';
+                    result.textContent = `✅ Test data uploaded successfully!\n\nResponse: ${JSON.stringify(data, null, 2)}\n\nData sent: ${JSON.stringify(testData, null, 2)}`;
+                } else {
+                    const errorData = await response.json().catch(() => ({}));
+                    result.className = 'result error';
+                    result.textContent = `❌ Upload failed!\n\nStatus: ${response.status} ${response.statusText}\nError: ${JSON.stringify(errorData, null, 2)}`;
+                }
+            } catch (error) {
+                result.className = 'result error';
+                result.textContent = `❌ Upload error!\n\nError: ${error.message}`;
+            }
+
+            button.disabled = false;
+            button.textContent = 'Send Test Data to Google Sheets';
+        });
+
+        // Check enabled status
+        document.getElementById('enabledStatus').textContent = '✅ Enabled (Pre-configured)';
+    </script>
+</body>
+</html> 

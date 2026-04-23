@@ -1,0 +1,40 @@
+{
+    "manifest_version": 3,
+    "name": "Low-Signature LinkedIn Agent",
+    "version": "1.0.0",
+    "description": "A user-initiated agent for low-and-slow data extraction from LinkedIn profiles.",
+    "background": {
+      "service_worker": "background.js"
+    },
+    "action": {
+      "default_popup": "popup.html",
+      "default_icon": {
+        "16": "icons/icon16.png",
+        "48": "icons/icon48.png",
+        "128": "icons/icon128.png"
+      }
+    },
+    "icons": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "permissions": [
+      "activeTab",
+      "scripting",
+      "storage",
+      "identity",
+      "proxy",
+      "webRequest",
+      "webRequestAuthProvider"
+    ],
+    "oauth2": {
+      "client_id": "YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+      "scopes": ["https://www.googleapis.com/auth/spreadsheets"]
+    },
+    "host_permissions": [
+      "<all_urls>",
+      "https://sheets.googleapis.com/*",
+      "https://generativelanguage.googleapis.com/*"
+    ]
+  }
