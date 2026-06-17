@@ -409,14 +409,20 @@ function _humanizeSubject(subject) {
   var humanized = subject;
 
   // Remove common AI patterns (but preserve "Application:" prefix — intentional for job-seeking)
+  // PATCH 2026-05-13 (AUDIT R11): removed /^(Job |Career )/i from aiPatterns.
+  // The branded subject prefix is intentionally "Job Application: <Topic>"
+  // (constructed in EmailComposer._buildSubjectLine with anti-duplication
+  // guard). When _humanizeSubject ran on the already-prefixed string, this
+  // pattern stripped "Job " producing "Application: Topic" — silent branding
+  // loss in every HTML email. Comment above already said "preserve
+  // Application: prefix" but the pattern contradicted that intent.
   var aiPatterns = [
     /^(RE:|FW:)\s*/i,
     /\[Important\]\s*/i,
     /\[Action Required\]\s*/i,
     /Your\s+personalized/i,
     /We wanted to reach out/i,
-    /Exciting opportunity/i,
-    /^(Job |Career )/i
+    /Exciting opportunity/i
   ];
 
   for (var i = 0; i < aiPatterns.length; i++) {

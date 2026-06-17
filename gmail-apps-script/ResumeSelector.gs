@@ -555,8 +555,29 @@ function _llmTiebreaker(lead, dossier, variant1, variant2) {
       'Option B (' + variant2 + '): Focused on ' + profile2.strengths.join(', ') + '\n\n' +
       'Which resume is the better fit? Reply ONLY with "A" or "B".';
 
-    // Use callGemini() so unified parser handles thought-skipping (gemini-2.5+) automatically
-    var result = callGemini(prompt, { temperature: 0, maxTokens: 5 });
+    // ── PATCH `-p5-vendorresilience-config` (Phase 3a): MAX_TOKENS bump ──
+    //
+    // The previous maxTokens=5 was correct for the desired OUTPUT (single
+    // char "A" or "B" — 1-2 output tokens). But Gemini 2.5+ thinking models
+    // consume internal thinking tokens against the same budget BEFORE
+    // producing visible output. With maxTokens=5, the model exhausts the
+    // budget on internal thinking, returns no visible text, and the
+    // tiebreaker silently falls back to variant1 EVERY TIME. That's
+    // effectively a dead tiebreaker.
+    //
+    // Two-part fix:
+    //   (a) Bump maxTokens to 64 to leave room for a small thinking budget
+    //       + the visible output. Cost increase is trivial (~$0.0001/call).
+    //   (b) Set thinkingConfig.thinkingBudget = 0 for the underlying request
+    //       — disabling thinking for this single-char-answer use case.
+    //       The `callGemini` wrapper applies thinkingConfig only when
+    //       responseFormat==='json'; we pass it explicitly here because
+    //       this is a text response.
+    var result = callGemini(prompt, {
+      temperature: 0,
+      maxTokens: 64,
+      thinkingBudget: 0   // forwarded to generationConfig.thinkingConfig
+    });
 
     if (result.success && result.data) {
       var text = result.data.trim().toUpperCase();

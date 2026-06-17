@@ -26,10 +26,34 @@
 function callGemini(prompt, options) {
   options = options || {};
 
-  var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY')
-    || 'YOUR_GEMINI_API_KEY';
+  // PATCH Phase 8 (Improvement #9 / security): hardcoded fallback removed.
+  // Previously a literal Gemini API key was stored in source as a fallback —
+  // a credential exposure risk visible to anyone with read access to the .gs
+  // file or to a copy of the project. Now: fail loudly if the key isn't set.
+  var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) {
-    return { success: false, error: 'Gemini API key not configured' };
+    Logger.log('[ApiClients] GEMINI_API_KEY script property is not set — Gemini calls will fail.');
+    return { success: false, error: 'Gemini API key not configured (set GEMINI_API_KEY script property)' };
+  }
+
+  // ── PATCH `-p5-vendorresilience-gemini` (Phase 2c circuit-breaker check) ──
+  //
+  // If a previous Gemini call hit HTTP 429 within the last 30 seconds, the
+  // backoff property is set to (now + 30000). Short-circuit immediately
+  // without making the network round-trip — saves ~7s of retry latency
+  // per call AND avoids piling on the rate limit. The PROPERTY name
+  // GEMINI_429_BACKOFF_UNTIL_MS is set by _fetchWithRetry on the response
+  // path below (also Phase 2c).
+  var bk = _geminiBackoffCheck();
+  if (bk.active) {
+    Logger.log('[ApiClients/Phase2c] callGemini short-circuit — backoff active for ' +
+               bk.remainingMs + 'ms (until ' + bk.untilISO + ')');
+    return {
+      success: false,
+      error: 'GEMINI_BACKED_OFF',
+      backoffActive: true,
+      backoffRemainingMs: bk.remainingMs
+    };
   }
 
   // Track API call
@@ -72,6 +96,17 @@ function callGemini(prompt, options) {
     }
   }
 
+  // ── PATCH `-p5-vendorresilience-config` (Phase 3a): explicit thinkingBudget ──
+  // Callers can pass `thinkingBudget: 0` to disable thinking even for text
+  // responses (e.g., ResumeSelector tiebreaker which expects a single char
+  // and previously got eaten by thinking tokens). Honored only on
+  // gemini-2.5+ models — older models ignore the field. If both
+  // responseFormat==='json' and options.thinkingBudget are set, the caller's
+  // explicit value wins.
+  if (typeof options.thinkingBudget === 'number' && model.indexOf('2.5') >= 0) {
+    payload.generationConfig.thinkingConfig = { thinkingBudget: options.thinkingBudget };
+  }
+
   try {
     var response = _fetchWithRetry(url, {
       method: 'post',
@@ -102,10 +137,27 @@ function callGemini(prompt, options) {
 function callGeminiGrounded(prompt, options) {
   options = options || {};
 
-  var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY')
-    || 'YOUR_GEMINI_API_KEY';
+  // PATCH Phase 8 (Improvement #9 / security): hardcoded fallback removed.
+  // Previously a literal Gemini API key was stored in source as a fallback —
+  // a credential exposure risk visible to anyone with read access to the .gs
+  // file or to a copy of the project. Now: fail loudly if the key isn't set.
+  var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) {
-    return { success: false, error: 'Gemini API key not configured' };
+    Logger.log('[ApiClients] GEMINI_API_KEY script property is not set — Gemini calls will fail.');
+    return { success: false, error: 'Gemini API key not configured (set GEMINI_API_KEY script property)' };
+  }
+
+  // PATCH `-p5-vendorresilience-gemini` (Phase 2c circuit-breaker check)
+  var bkG = _geminiBackoffCheck();
+  if (bkG.active) {
+    Logger.log('[ApiClients/Phase2c] callGeminiGrounded short-circuit — backoff active for ' +
+               bkG.remainingMs + 'ms (until ' + bkG.untilISO + ')');
+    return {
+      success: false,
+      error: 'GEMINI_BACKED_OFF',
+      backoffActive: true,
+      backoffRemainingMs: bkG.remainingMs
+    };
   }
 
   _trackApiCall('Gemini');
@@ -338,6 +390,20 @@ function _fetchWithRetry(url, options) {
 
       // Retry on 429 (rate limit) or 5xx errors
       if (responseCode === 429 || responseCode >= 500) {
+        // ── PATCH `-p5-vendorresilience-gemini` (Phase 2c): trip the Gemini
+        // circuit breaker on any 429 from Gemini. The flag has a 30-second
+        // TTL — subsequent Gemini calls within that window short-circuit at
+        // the callGemini entry without making the network call. Saves the
+        // ~7s of retry latency per call AND prevents piling on the rate
+        // limit during the cool-down period.
+        //
+        // Why we set it ON THE FIRST 429 not after retries: by the time the
+        // 3rd retry completes, we've spent ~7s. Setting on first detection
+        // means concurrent Gemini calls in the same execution can short-
+        // circuit immediately. Claude is unaffected (apiName check).
+        if (apiName === 'Gemini' && responseCode === 429) {
+          try { _setGeminiBackoff(30000); } catch (_bkErr) {}
+        }
         if (attempt < maxRetries - 1) {
           Logger.log('Retry ' + (attempt + 1) + '/' + (maxRetries - 1) + ' for ' + apiName + ' (code: ' + responseCode + ')');
           Utilities.sleep(backoffMs);
@@ -356,6 +422,52 @@ function _fetchWithRetry(url, options) {
         throw e;
       }
     }
+  }
+}
+
+// ─── PHASE 2c (`-p5-vendorresilience-gemini`): GEMINI CIRCUIT BREAKER ────────
+//
+// Two helpers used by callGemini / callGeminiGrounded / _fetchWithRetry:
+//   - _geminiBackoffCheck(): read the current backoff state
+//   - _setGeminiBackoff(ms): mark Gemini as backed-off for `ms` milliseconds
+//
+// Property key: GEMINI_429_BACKOFF_UNTIL_MS (epoch ms, integer string)
+// TTL: 30 seconds default — chosen to clear a typical 60-RPM-window
+// rate-limit without parking the pipeline for too long. Caller can override
+// by passing a different `ms` to _setGeminiBackoff.
+
+function _geminiBackoffCheck() {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var raw = props.getProperty('GEMINI_429_BACKOFF_UNTIL_MS');
+    if (!raw) return { active: false, remainingMs: 0, untilISO: '' };
+    var until = parseInt(raw, 10);
+    var now = Date.now();
+    if (isNaN(until) || now >= until) {
+      // Stale — proactively clean up so getProperties() stays lean
+      try { props.deleteProperty('GEMINI_429_BACKOFF_UNTIL_MS'); } catch (_) {}
+      return { active: false, remainingMs: 0, untilISO: '' };
+    }
+    return {
+      active: true,
+      remainingMs: until - now,
+      untilISO: new Date(until).toISOString()
+    };
+  } catch (e) {
+    return { active: false, remainingMs: 0, untilISO: '', error: e.message };
+  }
+}
+
+function _setGeminiBackoff(ms) {
+  if (typeof ms !== 'number' || ms <= 0) ms = 30000;
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var until = Date.now() + ms;
+    props.setProperty('GEMINI_429_BACKOFF_UNTIL_MS', String(until));
+    Logger.log('[ApiClients/Phase2c] Gemini circuit breaker TRIPPED — backoff for ' + ms +
+               'ms (until ' + new Date(until).toISOString() + ')');
+  } catch (e) {
+    Logger.log('[ApiClients/Phase2c] Could not set Gemini backoff: ' + e.message);
   }
 }
 
@@ -475,7 +587,10 @@ function _trackApiCall(apiName) {
   var today = new Date().toISOString().split('T')[0];
   var key = 'API_CALLS_' + apiName + '_' + today;
   var count = parseInt(props.getProperty(key)) || 0;
-  props.setProperty(key, (count + 1).toString());
+  // Telemetry only — a full property store must never break the API call
+  // itself (2026-06-12 incident: quota overflow here surfaced as vendor
+  // failures). Stale counters are swept by PipelineWatchdog Job 6.
+  try { props.setProperty(key, (count + 1).toString()); } catch (_) {}
   return count + 1;
 }
 

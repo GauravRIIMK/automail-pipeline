@@ -84,7 +84,7 @@ automail-pipeline/
 │   └── chrome-extension-notes/ ← historical change logs for the extension
 ├── android-app/                ← APK architecture & state machine (source is proprietary)
 ├── chrome-extension/           ← Chrome MV3 extension (background/content/popup)
-├── gmail-apps-script/          ← 17 .gs files: the whole pipeline
+├── gmail-apps-script/          ← 59 .gs files: the whole pipeline + test suite
 └── gmail-extractor/            ← Python OAuth2 extractor for seed data
 ```
 
@@ -108,7 +108,7 @@ Every surface has its own `README.md` with setup, architecture, and extension po
 The three surfaces can run independently. Follow [docs/SETUP.md](./docs/SETUP.md) for the full walk-through. TL;DR:
 
 1. **Fork + clone this repo.**
-2. **Apps Script:** open a Google Sheet → Extensions → Apps Script → paste the 17 `.gs` files from `gmail-apps-script/` + the `appsscript.json` manifest. Run `menuQuickSetup()` once.
+2. **Apps Script:** open a Google Sheet → Extensions → Apps Script → paste the 59 `.gs` files from `gmail-apps-script/` + the `appsscript.json` manifest. Run `menuQuickSetup()` once.
 3. **Add your keys** via the sheet menu (`AutoMail Pipeline → Setup → Set API Keys`) — Claude + Gemini. They are stored in Script Properties, not in code.
 4. **Deploy the Apps Script as a Web App** (Execute as: Me, Access: Anyone) to get the `/exec` URL your capture surfaces will POST to.
 5. **Chrome extension:** `chrome://extensions → Load unpacked → chrome-extension/`, then paste your OAuth client ID in `manifest.json` and the Web App URL in the popup settings.
@@ -129,6 +129,11 @@ This repo is a clean export — no real secrets are committed. Every one of the 
 | `YOUR_OAUTH_CLIENT_SECRET` | OAuth 2.0 client secret | same |
 | `YOUR_GCP_PROJECT_NUMBER` | Google Cloud project number | GCP Console → Home |
 | `YOUR_BRIGHTDATA_API_KEY` | Bright Data proxy key (optional — extension only) | https://brightdata.com |
+| `YOUR_APOLLO_API_KEY` (+ `_FALLBACK`) | Apollo.io enrichment + email-finder key (primary + fallback) | https://apollo.io |
+| `YOUR_SNOV_USER_ID` / `YOUR_SNOV_API_SECRET` | Snov.io OAuth client (email-finder fallback) | https://snov.io |
+| `YOUR_ADMIN_TOKEN` | Token guarding the Web App admin / diagnostic endpoints | self-generate any random string |
+| `YOUR_DEPLOYMENT_ID` | Apps Script Web App deployment ID (the long string in the `/exec` URL) | Deploy → Manage deployments |
+| `YOUR_GITHUB_PAT` | GitHub token used by an optional internal backup helper | https://github.com/settings/tokens |
 | `your.email@example.com` | Your sender email | the one you'll send from |
 
 Fill these in via environment variables / Script Properties / UI — never back into source. A `.env.example` template is in the root.
@@ -149,7 +154,8 @@ Full breakdown: [docs/COST_BREAKDOWN.md](./docs/COST_BREAKDOWN.md).
 
 ## 8. Safety & ethics
 
-- **Gmail rate limits:** hard-capped at 25 drafts/day, 20 sends/day, 3-second inter-draft delay, with a 5-week warmup schedule (5 / 10 / 15 / 20 / 25). See `gmail-apps-script/Config.gs` (`DELIVERABILITY`).
+- **Drafts, never auto-sends.** The pipeline only ever creates Gmail **drafts** — you review and hit send yourself. Nothing leaves your account automatically.
+- **Gmail rate limits:** a configurable daily draft cap (`DAILY_DRAFT_LIMIT`, default 200), a 3-second inter-draft delay, a multi-week warmup ramp, and automatic back-off when Gmail's short-window rate limit trips (the lead is parked and retried, not failed). See `gmail-apps-script/Config.gs` (`DELIVERABILITY`).
 - **Anti-hallucination:** every number, role, and alumni claim in a generated email is cross-checked against `GAURAV_ACHIEVEMENT_BANK` and `GAURAV_FACTS` — unverified claims bounce the email back to `REVIEW`.
 - **Spam-trigger filtering:** 40+ fatal + warning words are stripped pre-draft (see `SPAM_TRIGGER_WORDS`).
 - **OAuth scopes:** all surfaces request the minimum scope needed. Extension requests `spreadsheets` only; Apps Script requests compose/modify/drive/external_request only.
@@ -157,7 +163,22 @@ Full breakdown: [docs/COST_BREAKDOWN.md](./docs/COST_BREAKDOWN.md).
 
 ---
 
-## 9. License
+## 9. Reliability engineering
+
+Cold outreach runs unattended for weeks, so the hard part isn't the happy path — it's what happens when something breaks. Each mechanism below exists because a specific failure actually happened (or was anticipated) and needed a defense. The guiding principle: **fail loud, recover automatically, and never lose a lead or send the wrong thing.**
+
+- **Self-healing triggers.** A 30-minute watchdog re-installs any time-driven trigger Google silently dropped and deletes accidental duplicates, keeping the project under the 20-trigger cap. If a cron disappears, the system repairs itself within one cycle instead of going quietly dead.
+- **Resumable state machine.** Every lead's status is written back to the sheet after each stage, so a lead always resumes from its last good step. A crash mid-compose never loses work or double-charges the AI APIs.
+- **Lock-serialized writes.** Triggers can fire concurrently, so every sheet mutation passes through a script lock — two runs can never clobber the same row (a lost-update race that would otherwise silently drop leads).
+- **Quota-aware drafting.** Before spending a single AI token, the pipeline checks the Gmail draft quota; if it's exhausted it parks the lead (`PENDING_QUOTA_RESET`) and retries after the midnight reset — no wasted tokens, no burned retries.
+- **Capture audit trail.** Every inbound capture — accepted *or* rejected — is logged, so a lead that never appears can be diagnosed in seconds instead of vanishing without a trace.
+- **Current-employer reconciliation.** People update their LinkedIn headline before their experience section, so the captured "current company" can be stale. When the headline names a different employer than the captured org, the headline wins — preventing an email addressed to the wrong company.
+- **Append-only intake guard.** The raw-capture sheet is defended against a subtle Google Sheets trap — a stray filter silently turns row-appends into no-ops — that can otherwise freeze *all* new intake with no error at all.
+- **~550 automated tests.** A self-contained suite (run from the sheet menu or an admin endpoint) covers composition rules, classification, email selection, the state machine, and every fix above — so changes can't silently regress behaviour.
+
+---
+
+## 10. License
 
 MIT — see [LICENSE](./LICENSE). Use it, fork it, ship it; just don't blame me if Gmail flags your domain because you skipped the warmup schedule.
 

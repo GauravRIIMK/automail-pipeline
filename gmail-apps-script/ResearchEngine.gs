@@ -90,7 +90,11 @@ function researchLead(lead) {
  * @returns {Object} Company profile or null
  */
 function _researchCompany(lead) {
-  var companyName = lead.organization || lead.company || '';
+  // S3 (2026-06-12-sheet-truth): research companyName MUST be the SHEET ORGANIZATION
+  // verbatim (lead.organization). Old code also fell back to lead.company which could
+  // be dossier-derived or vendor-derived from a wrong-org enrichment path.
+  // lead.organization is populated directly from col E (sheet truth) in SheetReader.gs.
+  var companyName = (lead.organization || '').toString().trim() || (lead.company || '').toString().trim();
   if (!companyName) {
     return null;
   }
@@ -140,6 +144,34 @@ function _researchCompany(lead) {
     if (parsed.recentProductLaunches && parsed.recentProductLaunches.length > 10) depthScore++;
     logPipelineEvent(lead.rowNum, 'RESEARCH', 'Company depth: ' + depthScore + '/5 fields | Freshness: ' + freshness.score + '/5', 'INFO');
 
+    // PATCH `-eq8-content-fix` (#6): post-research entity-mismatch guard. If the
+    // company Gemini described is named substantially differently from the
+    // lead's org, the grounded search likely resolved the wrong entity. Flag it
+    // (token-overlap test after stripping legal suffixes) so the composer/
+    // reviewer can treat the dossier as suspect. Conservative — flags only when
+    // there is ZERO token overlap (won't false-positive on "Mosaic" vs
+    // "Mosaic Inc"). Same-name-different-entity is handled upstream by the
+    // domain anchor in _groundedCompanyResearch.
+    try {
+      var _strip = function(s) {
+        return (s || '').toString().toLowerCase()
+          .replace(/\b(pvt|private|ltd|limited|inc|incorporated|corp|corporation|llc|llp|gmbh|technologies|technology|labs|solutions|services|group|holdings|global|india|co)\b/g, ' ')
+          .replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+      };
+      var _qTokens = _strip(companyName).split(' ').filter(function(t) { return t.length >= 3; });
+      var _rTokens = _strip(parsed.name).split(' ').filter(function(t) { return t.length >= 3; });
+      if (_qTokens.length && _rTokens.length) {
+        var _overlap = _qTokens.some(function(t) { return _rTokens.indexOf(t) >= 0; });
+        if (!_overlap) {
+          parsed._orgMismatch = true;
+          parsed._orgMismatchDetail = 'queried "' + companyName + '" got "' + parsed.name + '"';
+          logPipelineEvent(lead.rowNum, 'RESEARCH',
+            'POSSIBLE ENTITY MISMATCH: ' + parsed._orgMismatchDetail +
+            ' — research may describe the wrong company. Dossier flagged _orgMismatch.', 'WARN');
+        }
+      }
+    } catch (_) {}
+
     return parsed;
   }
 
@@ -156,7 +188,37 @@ function _researchCompany(lead) {
  * @returns {string|null} Raw research text or null
  */
 function _groundedCompanyResearch(lead, companyName, today) {
-  var prompt = 'Today is ' + today + '. Research "' + companyName + '" thoroughly using web search.\n\n' +
+  // PATCH `-eq8-content-fix` (#6): anchor the grounded search to the SPECIFIC
+  // company via its resolved domain + the lead's LinkedIn URL. A bare name
+  // ("Bistro", "Mosaic", "Atlas") lets Gemini's web search resolve to the most
+  // prominent same-named entity — producing research about the wrong company.
+  // The domain (from enrichment) and the person's LinkedIn URL uniquely pin it.
+  //
+  // S3 (2026-06-12-sheet-truth): resolvedDomain passes only as a CORROBORATING
+  // HINT and ONLY when it passes the org-domain gate vs sheet org (else omitted).
+  // The email domain extracted from lead.email (col F) is also gated — if it
+  // doesn't match the org it may be from a wrong-path enrichment and must not
+  // anchor research to the wrong company.
+  var _rawDomain = (lead.resolvedDomain || (lead.email && lead.email.indexOf('@') > 0 ? lead.email.split('@')[1] : '') || '').toString().trim();
+  // Gate: only use the domain hint when it has org-token overlap with sheet org.
+  // _orgDomainGateRejects returns true when there is NO overlap (reject) — negate for "has overlap".
+  var _domainHint = '';
+  if (_rawDomain && _rawDomain.indexOf('placeholder.invalid') < 0) {
+    var _domainPassesOrgGate = (typeof _orgDomainGateRejects !== 'function') ||
+                               !_orgDomainGateRejects(lead.organization, 'x@' + _rawDomain, null);
+    if (_domainPassesOrgGate) {
+      _domainHint = _rawDomain;
+    } else {
+      Logger.log('[RESEARCH_S3] omitting domain hint "' + _rawDomain + '" — no org overlap with "' +
+                 (lead.organization || '') + '" (sheet org: "' + companyName + '")');
+    }
+  }
+  var _anchor = '';
+  if (_domainHint) _anchor += ' Their official website/email domain is "' + _domainHint + '" — research THIS specific company (the one at that domain), not any other company with a similar name.';
+  if (lead.linkedinUrl) _anchor += ' The target person\'s LinkedIn is ' + lead.linkedinUrl + ' (use it to confirm the exact employer).';
+
+  var prompt = 'Today is ' + today + '. Research "' + companyName + '"' +
+    (_domainHint ? ' (domain: ' + _domainHint + ')' : '') + ' thoroughly using web search.' + _anchor + '\n\n' +
     'I need the LATEST, most CURRENT information. Search the web for:\n\n' +
     '1. LATEST NEWS (last 3-6 months): Funding rounds (amount, investors, date), product launches, ' +
     'partnerships, acquisitions, leadership hires/departures, layoffs, pivots, awards. ' +
@@ -199,7 +261,23 @@ function _groundedCompanyResearch(lead, companyName, today) {
  * @returns {Object|null} Structured company profile or null
  */
 function _structureCompanyResearch(lead, companyName, rawResearch, today) {
-  var prompt = 'Extract and structure the following research about "' + companyName + '" into the required JSON format.\n' +
+  // PATCH 2026-06-11-eq8-contentguards (T4): anchor Pass-2 to the EXACT company.
+  // When the Pass-1 raw research accidentally describes a different company (same name,
+  // different entity), Pass-2 must return empty strings rather than the wrong company's
+  // data. The domain hint pins the identity.
+  // S3 (2026-06-12-sheet-truth): same org-gate guard as Pass 1 — only use domain hint
+  // when it passes the org-domain overlap check vs sheet org (lead.organization).
+  var _p2RawDomain = (lead.resolvedDomain || (lead.email && lead.email.indexOf('@') > 0 ? lead.email.split('@')[1] : '') || '').toString().trim();
+  var _p2Domain = '';
+  if (_p2RawDomain && _p2RawDomain.indexOf('placeholder.invalid') < 0) {
+    var _p2PassesGate = (typeof _orgDomainGateRejects !== 'function') ||
+                        !_orgDomainGateRejects(lead.organization, 'x@' + _p2RawDomain, null);
+    if (_p2PassesGate) _p2Domain = _p2RawDomain;
+  }
+  var _p2Anchor = _p2Domain ? ' (domain: ' + _p2Domain + ')' : '';
+  var prompt = 'The company being researched is EXACTLY "' + companyName + '"' + _p2Anchor + '. ' +
+    'If the raw research below describes a DIFFERENT company, output empty strings for all fields rather than the wrong company\'s data.\n\n' +
+    'Extract and structure the following research about "' + companyName + '" into the required JSON format.\n' +
     'Today is ' + today + '.\n\n' +
     '## RAW RESEARCH DATA\n' + rawResearch + '\n\n' +
     '## ADDITIONAL ANALYSIS NEEDED\n' +
@@ -293,12 +371,17 @@ function _scoreResearchFreshness(parsed) {
   var notes = [];
 
   // Check for date mentions (strong freshness signal)
+  // 2026-05-11 AUDIT FIX: previously 2024 scored as "fresh" — now ~18mo stale.
+  // Use the last full year + current year as the freshness window so a 2026
+  // cold email doesn't open with "as you announced in 2024…" framing.
+  var currentYear = new Date().getFullYear();
+  var freshYears = '(?:' + (currentYear - 1) + '|' + currentYear + ')';
   var allText = JSON.stringify(parsed).toLowerCase();
   var datePatterns = [
-    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+202[4-6]/gi,
-    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+202[4-6]/gi,
-    /\bq[1-4]\s+202[4-6]/gi,
-    /\b202[4-6]\b/g
+    new RegExp('\\b(january|february|march|april|may|june|july|august|september|october|november|december)\\s+' + freshYears, 'gi'),
+    new RegExp('\\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\\s+' + freshYears, 'gi'),
+    new RegExp('\\bq[1-4]\\s+' + freshYears, 'gi'),
+    new RegExp('\\b' + freshYears + '\\b', 'g')
   ];
 
   var dateCount = 0;
@@ -398,7 +481,7 @@ function _fallbackCompanyProfile(lead) {
     employeeRange: 'Unknown',
     founded: '',
     headquarters: '',
-    description: 'No data available',
+    description: '',  // PATCH `-eq8-content-fix` (#5): was 'No data available' — that literal leaked into email bodies. Empty string is handled by composer; the refusal-phrase string is not.
     recentNews: '',
     latestFundingRound: '',
     recentProductLaunches: '',
@@ -440,7 +523,18 @@ function _researchIndividual(lead) {
 
   var today = new Date().toISOString().split('T')[0];
 
-  var prompt = 'You are profiling "' + name + '" for personalized job-seeking outreach.\n' +
+  // PATCH 2026-06-11-eq8-contentguards (T4): anchor individual research to THIS
+  // specific person at THIS specific company. Without this anchor, Gemini grounded
+  // search can profile a different person with the same name or describe their
+  // PREVIOUS employer (e.g. "Your recent move to KnowledgeHut" when the recipient
+  // actually works at Apple). Mirrors the domain-anchor added to _groundedCompanyResearch.
+  var _indivDomain = (lead.resolvedDomain || (lead.email && lead.email.indexOf('@') > 0 ? lead.email.split('@')[1] : '') || '').toString().trim();
+  var _indivAnchor = '';
+  if (_indivDomain) _indivAnchor += ' Their current employer\'s email domain is "' + _indivDomain + '" — this is THEIR CURRENT company, research must confirm they work there NOW.';
+  if (linkedinUrl)  _indivAnchor += ' Their LinkedIn profile URL is ' + linkedinUrl + ' — use it to confirm current role and employer before citing any fact.';
+  if (company)      _indivAnchor += ' The CRM record shows their current employer as "' + company + '". If search results describe them at a DIFFERENT company, that data is stale; output empty strings for those fields rather than citing an old employer.';
+
+  var prompt = 'You are profiling "' + name + '" for personalized job-seeking outreach.' + _indivAnchor + '\n' +
     'Today is ' + today + '. Focus on the LATEST and most SPECIFIC information.\n\n' +
     '## PERSON DETAILS\n' +
     'Name: ' + name + '\n' +
@@ -477,12 +571,56 @@ function _researchIndividual(lead) {
     'Consider: their recent posts, company news, shared background, or a specific challenge you could discuss.\n' +
     '- estimatedEmailVolume: How many cold emails does this person likely receive daily? (Low/Medium/High/Very High)';
 
-  var result = callGemini(prompt, {
-    temperature: 0.3,
-    maxTokens: 3000,
-    responseFormat: 'json',
-    responseSchema: getIndividualResearchSchema()
-  });
+  // 2026-05-11 AUDIT FIX: switch to grounded search for individual research.
+  // Previous ungrounded Gemini call hallucinated LinkedIn posts + thought-
+  // leadership topics, which fed straight into hook generation and the email
+  // body. Reviewer flagged this as the highest-damage finding in the post-
+  // enrichment audit. Grounded Gemini uses Google Search to anchor claims.
+  // Falls back to ungrounded if grounded is unavailable.
+  var groundedRes = null;
+  try {
+    if (typeof callGeminiGrounded === 'function' && linkedinUrl) {
+      groundedRes = callGeminiGrounded(prompt + '\n\nUse Google Search to ground your claims about LinkedIn posts, public statements, and career moves. If you cannot find concrete evidence for a claim, write "" (empty string) for that field rather than inventing a plausible answer.', {
+        temperature: 0.2,
+        maxTokens: 3000
+      });
+    }
+  } catch (gErr) {
+    Logger.log('[ResearchEngine] Grounded individual research failed: ' + gErr.message);
+  }
+
+  var result;
+  if (groundedRes && groundedRes.success && groundedRes.data) {
+    // Re-extract JSON from the grounded text reply (grounded mode returns plain text + citations).
+    try {
+      var jsonMatch = groundedRes.data.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        result = { success: true, data: JSON.parse(jsonMatch[0]), source: 'grounded' };
+        Logger.log('[ResearchEngine] Individual research: grounded JSON parse OK');
+      } else {
+        // Grounded returned narrative — convert to structured via ungrounded second pass
+        var followup = callGemini('Convert the following research notes into strict JSON matching the schema:\n\n' + groundedRes.data, {
+          temperature: 0.0, maxTokens: 3000, responseFormat: 'json', responseSchema: getIndividualResearchSchema()
+        });
+        result = followup.success ? followup : null;
+        if (result) result.source = 'grounded_then_structured';
+      }
+    } catch (parseErr) {
+      Logger.log('[ResearchEngine] Grounded result parse failed: ' + parseErr.message);
+      result = null;
+    }
+  }
+
+  // Fallback: ungrounded structured-output if grounded failed or returned nothing
+  if (!result || !result.success) {
+    result = callGemini(prompt + '\n\nIMPORTANT: if you cannot verify a LinkedIn post or public statement from training data, write "" for that field. Do NOT invent plausible-sounding posts.', {
+      temperature: 0.3,
+      maxTokens: 3000,
+      responseFormat: 'json',
+      responseSchema: getIndividualResearchSchema()
+    });
+    if (result.success) result.source = 'ungrounded_with_anti_hallucination_directive';
+  }
 
   // Check for empty response
   if (result.success && (!result.data || (typeof result.data === 'string' && result.data.trim().length === 0))) {
@@ -1232,6 +1370,10 @@ function _compressDossier(dossier) {
     companyName: company.name || '',
     industryStage: (company.industry || 'Unknown') + ' / ' + (company.stage || 'UNKNOWN'),
     companyDescription: company.description || '',
+    // PATCH -eq8-draftpolish (F3): persist entity-mismatch flags so BatchProcessor
+    // can gate on them after decompression (compression previously stripped _orgMismatch).
+    orgMismatch: company._orgMismatch ? true : false,
+    orgMismatchDetail: company._orgMismatchDetail || '',
     // New: richer company context
     recentNews: company.recentNews || '',
     latestFunding: company.latestFundingRound || '',
@@ -1309,7 +1451,10 @@ function decompressDossier(compressed) {
       // Legacy compat
       fundingInfo: obj.latestFunding || '',
       size: null,
-      domain: null
+      domain: null,
+      // PATCH -eq8-draftpolish (F3): restore entity-mismatch flags from compressed storage
+      _orgMismatch: obj.orgMismatch ? true : false,
+      _orgMismatchDetail: obj.orgMismatchDetail || ''
     };
     var hooks = _safeParse(obj.hooksJson, []);
     var triggers = _safeParse(obj.triggersJson, []);
@@ -1349,7 +1494,11 @@ function decompressDossier(compressed) {
       // Quality
       qualityScore: parseFloat(obj.qualityScore) || 0,
       qualityIssues: obj.qualityIssues ? obj.qualityIssues.split('; ') : [],
-      timestamp: obj.timestamp || null
+      timestamp: obj.timestamp || null,
+      // PATCH -eq8-draftpolish (F3): top-level alias so BatchProcessor gate works
+      // whether it checks compressedDossier._orgMismatch or compressedDossier.company._orgMismatch
+      _orgMismatch: obj.orgMismatch ? true : false,
+      _orgMismatchDetail: obj.orgMismatchDetail || ''
     };
   } catch (e) {
     Logger.log('decompressDossier: Failed to parse - ' + e.message);

@@ -63,18 +63,28 @@ function runQualityGate(subjectLine, emailBody, lead, classification) {
       checks.spamTriggers.riskLevel === 'HIGH' ? 'WARN' : 'INFO');
   }
 
-  // ─── Stage 3: Email Length Optimization (2026 optimal: 50-125 words) ────────
+  // ─── Stage 3: Email Length Optimization (BULLET_V1: 80-220 sweet spot) ────
+  // The 2026 reference-format restructure raises the cap because bullet lists
+  // mirror the candidate's two best-performing emails (Kapture / MAS) which
+  // both run 150-200 words. Sub-80 words now indicates an empty bullet list.
+  var maxLen = (typeof CONFIG !== 'undefined' && CONFIG.EMAIL_FORMAT && CONFIG.EMAIL_FORMAT.bodyWordCountMax) || 220;
+  var minLen = (typeof QUALITY_GATES !== 'undefined' && QUALITY_GATES.minLengthWords) || 80;
   checks.length = _analyzeEmailLength(emailBody);
-  if (checks.length.wordCount > 125) {
-    // Slight deduction for over 125 words
+  if (checks.length.wordCount > maxLen) {
+    // Soft deduction for going over the bullet-format cap
     deductions += 0.05;
     optimizations.push(
-      '[OPTIMIZATION] Email is ' + checks.length.wordCount + ' words. ' +
-      'Emails under 125 words see 15% higher reply rates.'
+      '[OPTIMIZATION] Email is ' + checks.length.wordCount + ' words (cap: ' + maxLen + '). ' +
+      'Trim a bullet body or skip the motivation paragraph for tighter delivery.'
     );
   }
-  if (checks.length.wordCount < 30) {
-    warnings.push('Email is too short (' + checks.length.wordCount + ' words) - add more detail');
+  if (checks.length.wordCount > maxLen + 60) {
+    // Hard penalty for blowing past the cap by a lot
+    deductions += 0.10;
+    warnings.push('Email is ' + checks.length.wordCount + ' words — significantly over cap. Trim hard.');
+  }
+  if (checks.length.wordCount < minLen) {
+    warnings.push('Email is too short (' + checks.length.wordCount + ' words) — bullet list likely empty or too sparse');
     deductions += 0.1;
   }
 
@@ -270,9 +280,10 @@ function _analyzeEmailLength(emailBody) {
   var words = text.split(/\s+/).filter(function(w) { return w.length > 0; });
   var wordCount = words.length;
 
-  var optimal = wordCount >= 50 && wordCount <= 125;
-  var tooShort = wordCount < 30;
-  var tooLong = wordCount > 150;
+  // BULLET_V1 reference-format ranges (2026)
+  var optimal = wordCount >= 80 && wordCount <= 220;
+  var tooShort = wordCount < 50;
+  var tooLong = wordCount > 280;
 
   return {
     wordCount: wordCount,
@@ -572,13 +583,25 @@ function _generateFeedback(passed, score, warnings, optimizations, spamCheck, le
 
 /**
  * Attempts to fix a failed email by asking Claude to revise it based on quality feedback.
- * Called by BatchProcessor._processOneLead when quality gate fails.
+ * Called by BatchProcessor._processOneLead when the quality gate fails, and again
+ * when MasterValidator verdicts RECOMPOSE.
+ *
+ * PATCH 2026-06-12-recomp-bullets: the revision contract is now the unified
+ * BULLET_V1 shape (greeting / hook / 3 metric-led experience bullets / closing
+ * logistics / PS-last) instead of the legacy prose shape. Flow mirrors the
+ * primary compose path: _parseCompositionResponse (canonical parse + field
+ * injection) -> _normalizeParsedFields -> _quickValidate (any FATAL, including
+ * the <2-bullets-non-CXO ship-gate, FORFEITS) -> _buildHtmlEmail (bullet
+ * renderer). A forfeit returns null, which makes the recomposition lose both
+ * score comparisons in BatchProcessor, so the original ships instead of a
+ * prose-shaped draft. (This JSDoc sits outside Function.toString() — the
+ * pinned introspection test anchors live in the function body only.)
  *
  * @param {string} originalBody - The email body that failed quality gate
  * @param {string} originalSubject - The subject line that failed
  * @param {string} feedback - Quality gate feedback explaining what failed
  * @param {Object} lead - Lead object with fullName, email, designation, etc.
- * @returns {Object|null} { subjectLine, emailBody } on success, null on failure
+ * @returns {Object|null} { subjectLine, emailBody } on success, null on failure/forfeit
  */
 function attemptRecomposition(originalBody, originalSubject, feedback, lead) {
   try {
@@ -589,31 +612,45 @@ function attemptRecomposition(originalBody, originalSubject, feedback, lead) {
       'QUALITY FEEDBACK (issues to fix):\n' + feedback + '\n\n' +
       'COLD EMAIL PLAYBOOK RULES:\n' +
       '- This is a job-seeking cold email, NOT sales outreach\n' +
-      '- Keep 50-125 words, 2-4 word subject line\n' +
+      '- 2-5 word subject line; body roughly 100-150 words across hook, bullets, and closing\n' +
       '- Never ask for a job directly — ask for a conversation\n' +
       '- Include a P.S. line as a second hook\n' +
       '- No banned openers: "I hope this email finds you well", "My name is", "I\'m reaching out because", "I wanted to reach out"\n\n' +
       'INSTRUCTIONS:\n' +
       '- Fix ALL issues mentioned in the feedback\n' +
       '- Keep the same general message and personalization hooks\n' +
-      '- Keep under 125 words for optimal deliverability\n' +
       '- Maintain a professional, human tone\n' +
       '- Do NOT use spam trigger words (free, guaranteed, act now, etc.)\n' +
       '- Focus on the recipient (more "you/your" than "I/my")\n' +
-      '- Email body is now HTML-formatted — use <p> tags to separate paragraphs\n\n' +
+      '- The revised email MUST follow the unified bullet architecture: greeting, hook, EXACTLY 3 metric-led experience bullets, closing logistics with the 15-minute ask, P.S. last\n' +
+      '- NEVER collapse the three experience bullets into prose paragraphs\n' +
+      '- hookParagraph must NOT start with a greeting; the greeting lives only in the greeting field\n\n' +
       'Return ONLY valid JSON with the following format:\n' +
       '{\n' +
-      '  "subjectLine": "revised subject line",\n' +
-      '  "bodyParagraphs": ["paragraph 1", "paragraph 2", "paragraph 3"],\n' +
-      '  "cta": "call to action text",\n' +
-      '  "psLine": "P.S. line"\n' +
+      '  "subjectLine": "2-5 word topic only",\n' +
+      '  "greeting": "Hi [FirstName],",\n' +
+      '  "hookParagraph": "1-2 sentences tying the recipient\'s org and role to Gaurav\'s background. Under 60 words.",\n' +
+      '  "bridgeSentence": "Three 0-to-1 builds that map directly to this role:",\n' +
+      '  "experienceBullets": [\n' +
+      '    {"label": "Blinkit Bistro (current)", "body": "<metric-led outcome, 18 words or fewer>", "showLorTag": false},\n' +
+      '    {"label": "upGrad (2021-23)", "body": "<metric-led outcome, 18 words or fewer>", "showLorTag": false},\n' +
+      '    {"label": "Great Learning (2019-20)", "body": "<metric-led outcome, 18 words or fewer>", "showLorTag": false}\n' +
+      '  ],\n' +
+      '  "showAiToolsBlock": true,\n' +
+      '  "motivationParagraph": "The thread across all three: <one-line pattern>",\n' +
+      '  "closingLogistics": "Based in Gurgaon and available to start immediately. Would value 15 minutes to discuss how this maps to what your team is building.",\n' +
+      '  "signoffText": "Thanks and regards",\n' +
+      '  "psLine": "<second concrete signal, 12-28 words, tied to the org or its space>"\n' +
       '}\n\n' +
-      'CRITICAL: The CTA text must appear ONLY in the "cta" field — NEVER inside bodyParagraphs. ' +
-      'Each field (bodyParagraphs, cta, psLine) must contain UNIQUE content; do not repeat the same sentence across fields.';
+      'CRITICAL RULES FOR experienceBullets:\n' +
+      '- EXACTLY 3 items, company labels EXACTLY as shown above, in that order\n' +
+      '- Each body: action verb first, one quantified outcome, 18 words or fewer, never "I"\n' +
+      '- Do NOT mention resume/attached/CV in hookParagraph or bullet bodies\n' +
+      '- No em-dashes, no smart quotes, plain ASCII only';
 
     var response = callClaude(prompt, {
       temperature: 0.7,
-      maxTokens: 1000
+      maxTokens: 1200
     });
 
     if (!response.success) {
@@ -621,48 +658,84 @@ function attemptRecomposition(originalBody, originalSubject, feedback, lead) {
       return null;
     }
 
-    // Parse the JSON response
     var text = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
 
-    // Extract JSON from potential markdown code blocks
-    var jsonMatch = text.match(/\{[\s\S]*"subjectLine"[\s\S]*"bodyParagraphs"[\s\S]*\}/);
-    if (!jsonMatch) {
-      logPipelineEvent(lead.rowNum, 'RECOMPOSE', 'Failed to parse recomposition response', 'ERROR');
+    // PATCH 2026-06-12-recomp-bullets: the recomposition contract is now the
+    // unified bullet shape. Previously this function requested a prose JSON
+    // shape, so a winning recomposition rendered through the legacy prose
+    // path with no bullet structure - the last path that could ship a
+    // non-standard draft (live example: dushyant.panda@razorpay.com /
+    // "Growth Marketing Role"). The revised flow mirrors the primary compose
+    // path exactly: canonical parse (with canonical-field injection) ->
+    // normalize -> shape gate -> canonical render. On any gate failure the
+    // recomposition FORFEITS (returns null) so the original email ships and
+    // the score comparisons in BatchProcessor never see a prose candidate.
+    var parsed = _parseCompositionResponse(text);
+    if (!parsed || !parsed.subjectLine) {
+      logPipelineEvent(lead.rowNum, 'RECOMPOSE', 'Failed to parse recomposition response via canonical parser', 'ERROR');
       return null;
     }
 
-    var parsed = JSON.parse(jsonMatch[0]);
+    // Same normalize-before-validate sequence as the primary compose path
+    // (idempotent; the canonical parser already ran it for bullet shapes).
+    try { _normalizeParsedFields(parsed); } catch (_normErr) {
+      Logger.log('[RECOMPOSE] pre-validate normalize skipped: ' + _normErr.message);
+    }
 
-    if (!parsed.subjectLine || !parsed.bodyParagraphs || !Array.isArray(parsed.bodyParagraphs)) {
-      logPipelineEvent(lead.rowNum, 'RECOMPOSE', 'Recomposition missing subject, bodyParagraphs, or invalid format', 'ERROR');
+    // Shape gate - the identical validator the primary compose path uses.
+    // Its bullet-count ship-gate (<2 bullets on a non-CXO shape) is the
+    // specific check this patch exists to enforce on recompositions.
+    var validation;
+    try {
+      validation = _quickValidate(parsed, lead);
+    } catch (_valErr) {
+      logPipelineEvent(lead.rowNum, 'RECOMPOSE', 'Shape gate threw (' + _valErr.message + ') - recomposition forfeits', 'ERROR');
       return null;
     }
-
-    // Normalize + dedupe before reconstruction (defend against model re-emitting CTA in body).
-    // Uses _dedupParsedComposition from EmailComposer.gs (shared helper).
-    parsed.bodyParagraphs = parsed.bodyParagraphs.map(function(p) { return (p || '').toString().trim(); }).filter(function(p) { return p.length > 0; });
-    parsed.cta = (parsed.cta || '').toString().trim();
-    parsed.psLine = (parsed.psLine || '').toString().trim();
-    if (typeof _dedupParsedComposition === 'function') {
-      _dedupParsedComposition(parsed);
-    }
-
-    // Reconstruct HTML email from paragraphs, CTA, and P.S.
-    var emailParts = [];
-    parsed.bodyParagraphs.forEach(function(para) {
-      emailParts.push('<p>' + para + '</p>');
+    var fatalIssues = (validation && validation.issues ? validation.issues : []).filter(function(i) {
+      return i.indexOf('FATAL') >= 0;
     });
-    if (parsed.cta) {
-      emailParts.push('<p><strong>' + parsed.cta + '</strong></p>');
+    if (fatalIssues.length > 0) {
+      logPipelineEvent(lead.rowNum, 'RECOMPOSE',
+        'Recomposition failed shape gate (' + fatalIssues.slice(0, 2).join('; ') + ') - forfeiting so the original ships', 'WARN');
+      return null;
     }
-    if (parsed.psLine) {
-      emailParts.push('<p><strong>P.S.</strong> ' + parsed.psLine + '</p>');
-    }
-    var emailBody = emailParts.join('\n');
 
-    logPipelineEvent(lead.rowNum, 'RECOMPOSE', 'Successfully recomposed email', 'INFO');
+    // Canonical render. With the bullet payload present this routes to the
+    // unified bullet renderer (banner + bullets + builder block + Calendly
+    // CTA + PS-last). The old bare-paragraph fallback is gone on purpose:
+    // a render failure forfeits the recomposition instead of shipping
+    // unstyled prose.
+    var emailBody;
+    try {
+      emailBody = _buildHtmlEmail(parsed, lead, null);
+    } catch (renderErr) {
+      logPipelineEvent(lead.rowNum, 'RECOMPOSE',
+        'Canonical render failed (' + renderErr.message + ') - recomposition forfeits', 'ERROR');
+      return null;
+    }
+
+    logPipelineEvent(lead.rowNum, 'RECOMPOSE', 'Successfully recomposed email (bullet contract, canonical renderer)', 'INFO');
+
+    // PATCH 2026-06-12-template-unify: canonicalize the recomposed subject.
+    // attemptRecomposition returns raw Claude subject (e.g. "Growth Marketing Role")
+    // without the "Job Application: ... | Gaurav Rathore" canonical format.
+    // Route through _buildSubjectLine (STANDARD path, isCxoShort=false) so the
+    // subject guard (S5) and S4 positioning guard both fire, guaranteeing canonical
+    // format regardless of what Claude returned in the recomposition response.
+    // _buildSubjectLine lives in EmailComposer.gs — always in scope in GAS.
+    var _recompRawSubject = (parsed.subjectLine || '').toString().trim();
+    var _recompFinalSubject = _recompRawSubject;
+    if (typeof _buildSubjectLine === 'function') {
+      try {
+        _recompFinalSubject = _buildSubjectLine(_recompRawSubject, lead, {}, false);
+      } catch (_recompSubjErr) {
+        Logger.log('[RECOMPOSE] _buildSubjectLine threw on recomp subject — using raw: ' + _recompSubjErr.message);
+      }
+    }
+
     return {
-      subjectLine: parsed.subjectLine.trim(),
+      subjectLine: _recompFinalSubject,
       emailBody: emailBody
     };
 
