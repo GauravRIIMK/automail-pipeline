@@ -11,6 +11,69 @@
 
 ---
 
+## ✨ What makes this first-of-its-kind
+
+Cold-outreach automation isn't new — Apollo, Outreach, lemlist, and Instantly have existed for years. What's novel here is the **combination of five choices that no existing tool makes *together*:**
+
+1. **Capture at the source.** You add a lead from *inside the LinkedIn app you're already scrolling* — one tap on the phone, one click in the browser — not by exporting a CSV or pasting a URL into a dashboard. The gap between "I should reach out to them" and "they're in the pipeline" collapses to a single gesture.
+2. **It runs on infrastructure you already own.** The entire brain is a **Google Sheet + Apps Script** — no server to rent, no per-seat subscription, no data leaving your Google account. Your CRM, your queue, and your automation are the *same spreadsheet* you can open and edit by hand.
+3. **The AI writes drafts — it never sends.** Every other "AI SDR" optimises for hands-off sending, which is exactly what torches sender reputation and fires hallucinations off at scale. This inverts that: it automates the 95% that's tedious (research, writing, formatting, attaching, scheduling) and leaves the 5% that carries the risk — hitting *send* — to you.
+4. **The model is fact-checked, not trusted.** Every number, role, and claim the LLM writes is cross-checked against a verified fact-bank; anything it can't prove bounces the email back to review. The LLM is treated as a *constrained draft-writer*, not an oracle — the opposite of "let the model write it and hope."
+5. **Production reliability on a 'toy' platform.** Apps Script is normally used for throwaway scripts. This applies real site-reliability discipline to it — self-healing triggers, lock-serialised writes, an idempotent resumable state machine, quota-aware back-off — so it survives running unattended for weeks.
+
+> **The deepest novelty is conceptual:** most tools sell you *an AI that sends emails.* This is *a verification-and-reliability pipeline that happens to use an AI to draft them.* That inversion is what makes the output trustworthy enough to put your own name on.
+
+---
+
+## 🧠 The logic — and why it's the right one
+
+Every major design decision is a deliberate answer to a specific risk. The reasoning, made explicit:
+
+| Design choice | Why it's the logical one (the second-order reasoning) |
+|---|---|
+| **A spreadsheet as the database** | Free, zero-ops, and *visible* — you watch every lead move through its states and fix one by editing a cell. The sheet is the database, the dashboard, **and** the manual-override console at once. At single-operator scale a "real" database would add ops cost and *remove* that transparency. |
+| **A deterministic state machine** | Outreach is a long-running, interruptible job on a flaky platform. Writing each lead's status back after every step means any lead **resumes from its last good step** — a crash never loses work or double-charges an API. |
+| **Draft, don't send** | The marginal *value* of automating the final send is tiny; the marginal *risk* (a flawed email to a dream contact, or a burned sending domain) is enormous. Automating up-to-the-send and stopping is the only rational risk/reward split. |
+| **Verify every claim** | A hallucinated metric in a cold email to an investor or hiring manager is *instantly* disqualifying, while a verification lookup is nearly free. When the downside is catastrophic and the check is cheap, you **always** check. |
+| **A multi-vendor enrichment waterfall** | No single email source has full coverage. Cascading providers (Apollo → Hunter → Snov → pattern) and stopping at the first verified hit maximises match rate while minimising cost — you only pay the next vendor when the previous one misses. |
+| **Idempotent, self-healing, lock-serialised** | The substrate (Apps Script triggers, Gmail quotas) is unreliable *by nature*. The logical response to an unreliable foundation is to make every operation retry-safe, every trigger self-repairing, and every write conflict-free. |
+
+> **The throughline:** *assume every component will fail, make failure cheap and recoverable, and keep a human at the one irreversible step.*
+
+---
+
+## ⏱️ How it changes your day-to-day
+
+A genuinely personalised, researched cold email — find the person, read their background and company news, locate a valid address, write something tailored, attach the right document, and remember to follow up three times — takes a careful person **20–40 minutes**. This compresses it to about **two minutes of your attention**: one tap to capture, a glance to approve the draft, one click to send.
+
+What that actually changes:
+
+- **Reach stops being rationed by time.** When quality outreach costs ~2 minutes instead of ~30, you can finally contact the people you'd normally skip "because it isn't worth the effort." The economics of attention flip.
+- **Follow-ups actually happen.** Most people send one email and quit — yet most replies come from the 2nd and 3rd touch. Automatic Day 3 / 7 / 14 follow-ups (in-thread, anchored to the real send date) roughly **triple your touchpoints** without a single reminder.
+- **Your *worst* email gets better.** Every message is researched, fact-checked, and spam-filtered before you ever see it — so even on a tired day, nothing generic, false, or sloppy goes out under your name.
+- **The mental overhead disappears.** No blank page, no "did I already email them?", no spreadsheet bookkeeping. The pipeline *is* the memory.
+
+> **The second-order effect is the real one:** it converts outreach from a *batch-and-blast vs. hand-craft-a-few* trade-off into **hand-crafted quality at blast scale** — while the human-in-the-loop send keeps you in control of, and learning from, every message.
+
+---
+
+## 🎯 Who it's for — pitch decks, B2B sales, and beyond
+
+Job applications were just the *first* use. Strip it to the architecture and this is a **personalised-outreach engine**: capture → enrich → research → write → verify → draft → follow up. Only **three** things are domain-specific — *the attachment, the fact-bank, and the message templates.* Everything else is universal, which is why it re-points at a new use case in minutes, not weeks.
+
+| Who | What they capture | What the engine does | What you swap in |
+|---|---|---|---|
+| **Startup founder → investors** | A VC / angel from LinkedIn | Researches their thesis + recent cheques, writes a tailored intro that references their portfolio, **attaches your pitch deck**, then follows up | Resume → **pitch deck**; fact-bank → your traction metrics |
+| **B2B sales / SDR** | A VP / Director at a target account | Finds the work email, writes a value-prop tied to their role + the company's recent news, attaches a one-pager, sequences the follow-ups | Resume → **one-pager / case study**; templates → your offer |
+| **Recruiter / sourcer** | A passive candidate | Personalised outreach referencing their actual background, attaches the role's spec | Resume → **job description** |
+| **Partnerships / BD** | A potential partner | Researches their company and proposes a *specific, concrete* collaboration | Fact-bank → your partnership assets |
+| **Consultant / agency** | A decision-maker | Case-study-anchored outreach that proves relevant, verifiable results | Fact-bank → your client wins |
+| **Job seeker** *(original)* | A hiring manager / future team lead | Archetype-matched application email with the right resume variant attached | — *(works out of the box)* |
+
+> **Why one engine covers all of these:** the hard, universal, risky parts — deliverability, email-finding, real-time research, anti-hallucination, follow-up sequencing, and unattended reliability — are solved **once**, inside the pipeline. Re-aiming it at a new campaign means changing only **what you attach and what you're allowed to claim** — never rebuilding the machine.
+
+---
+
 ## 1. What this repo does
 
 You are on LinkedIn. You see a profile you'd love to talk to. One tap (phone) or one click (browser) later:
