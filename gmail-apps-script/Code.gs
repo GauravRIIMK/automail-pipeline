@@ -9,13 +9,31 @@
 // ─── CUSTOM MENU ───────────────────────────────────────────
 
 function onOpen() {
+  // PATCH Phase 8 (F-29 fix): bootstrap the PipelineWatchdog trigger if it has
+  // been silently dropped (auth re-grant, quota event, manual menu removal).
+  // onOpen runs in AuthMode.LIMITED but ScriptApp.getProjectTriggers() and
+  // newTrigger().create() are reachable at that scope. Failures are silent —
+  // the user still gets the menu; just the auto-heal didn't kick in. The
+  // explicit menu "Setup Auto-Process Trigger" remains as the escape hatch.
+  try {
+    var hasWatchdog = ScriptApp.getProjectTriggers().some(function(t) {
+      return t.getHandlerFunction() === 'pipelineWatchdog';
+    });
+    if (!hasWatchdog && typeof installPipelineWatchdog === 'function') {
+      installPipelineWatchdog();
+    }
+  } catch (_) {
+    // Silent — onOpen MUST NOT throw or the menu disappears
+  }
+
   var ui = SpreadsheetApp.getUi();
   ui.createMenu('AutoMail Pipeline')
     .addItem('Run Pipeline (Next Batch)', 'menuRunBatch')
     .addItem('Process Single Lead (Current Row)', 'menuProcessCurrentRow')
     .addSeparator()
     .addItem('Create Draft for Current Row', 'menuCreateDraftCurrentRow')
-    .addItem('View Pipeline Dashboard', 'menuShowDashboard')
+    .addItem('Open Pipeline Dashboard (Sidebar)', 'showSidebar')
+    .addItem('View Pipeline Dashboard (Modal)', 'menuShowDashboard')
     .addSeparator()
     .addSubMenu(ui.createMenu('Setup')
       .addItem('⚡ Quick Setup (Columns + Keys)', 'menuQuickSetup')
@@ -25,7 +43,10 @@ function onOpen() {
       .addItem('3. Set Resume Drive IDs', 'menuSetResumeDriveIds')
       .addItem('4. Test API Connections', 'testApiConnections')
       .addItem('5. Setup Follow-Up Trigger', 'setupFollowUpTrigger')
-      .addItem('6. Setup Auto-Process Trigger (Sheet2 onEdit)', 'setupAutoProcessTrigger'))
+      .addItem('6. Setup Auto-Process Trigger (Sheet2 onEdit)', 'setupAutoProcessTrigger')
+      .addItem('7. Bootstrap Reoon + LOR + Web App Secret', 'menuBootstrapReoonLor')
+      .addItem('8. Clear Reoon Verify Cache', 'clearReoonCache')
+      .addItem('9. Install WebApp Warm-Keeper (fixes Tracking-tab timeout)', 'menuInstallWarmKeeper'))
     .addSubMenu(ui.createMenu('Tools')
       .addItem('Research Only (Current Row)', 'menuResearchCurrentRow')
       .addItem('Classify Only (Current Row)', 'menuClassifyCurrentRow')
@@ -35,7 +56,12 @@ function onOpen() {
       .addItem('Reset Current Row Status', 'menuResetCurrentRow')
       .addSeparator()
       .addItem('View Run Diagnostics', 'menuViewDiagnostics')
-      .addItem('View Errors for Current Row', 'menuViewRowErrors'))
+      .addItem('View Errors for Current Row', 'menuViewRowErrors')
+      .addSeparator()
+      // PATCH Phase 1 remediation sprint (A13 closure): Tests.gs harness wiring.
+      // runAllTests() is the spine for the entire remediation sprint TDD discipline.
+      .addItem('🧪 Run all tests', 'menuRunAllTests')
+      .addItem('🧪 Run smoke tests only', 'menuRunSmokeTests'))
     .addSeparator()
     .addItem('Remove All Triggers (Emergency)', 'removeAllTriggers')
     .addToUi();
@@ -146,6 +172,130 @@ function menuQuickSetup() {
   ui.alert('Quick Setup Complete', log.join('\n'), ui.ButtonSet.OK);
 }
 
+// ─── BOOTSTRAP REOON + LOR + WEB APP SECRET ────────────────
+//
+// Two callable forms:
+//   menuBootstrapReoonLor()           — interactive (Browser.inputBox prompts)
+//   _bootstrapSecrets(reoon, lor, sec)— headless (clasp run --params [...])
+//
+// Both write to PropertiesService.getScriptProperties() so the literal
+// values never live in source. menuBootstrapReoonLor() also prompts a
+// Quick Setup re-run so the resume IDs and base API keys are set in one go.
+
+/**
+ * Interactive bootstrap — prompts for Reoon API key, LOR Drive ID, and Web App secret.
+ * Call this from the AutoMail Pipeline → Setup menu.
+ */
+function menuBootstrapReoonLor() {
+  var ui = SpreadsheetApp.getUi();
+  var props = PropertiesService.getScriptProperties();
+
+  // Reoon API key
+  var reoonKeyName = (CONFIG.PROPERTY_KEYS && CONFIG.PROPERTY_KEYS.REOON_API_KEY) || 'REOON_API_KEY';
+  var existing = props.getProperty(reoonKeyName);
+  var promptMsg = existing
+    ? 'Reoon API key is already set (length=' + existing.length + '). Paste a new key to replace it, or click Cancel to keep.'
+    : 'Paste your Reoon Email Verifier API key (looks like ak_XXXXXXXXXXXX). Get one at reoon.com — free tier is 600 verifications/month.';
+  var resp = ui.prompt('Reoon API Key', promptMsg, ui.ButtonSet.OK_CANCEL);
+  if (resp.getSelectedButton() === ui.Button.OK) {
+    var k = resp.getResponseText().trim();
+    if (k && k.length > 8) {
+      props.setProperty(reoonKeyName, k);
+      ui.alert('Reoon key saved.');
+    }
+  }
+
+  // Hunter.io API key (optional fallback for hard-to-find emails)
+  var hunterKeyName = (CONFIG.PROPERTY_KEYS && CONFIG.PROPERTY_KEYS.HUNTER_API_KEY) || 'HUNTER_API_KEY';
+  var existingHunter = props.getProperty(hunterKeyName);
+  var hunterMsg = existingHunter
+    ? 'Hunter.io API key is set (length=' + existingHunter.length + '). Paste a new key to replace, or click Cancel to keep.'
+    : '(Optional) Paste your Hunter.io API key for the Email Finder fallback — kicks in only when Reoon can\'t verify any of the 5 guessed patterns. Free tier is 25 lookups/month at hunter.io. Click Cancel to skip.';
+  var hresp = ui.prompt('Hunter.io API Key (optional)', hunterMsg, ui.ButtonSet.OK_CANCEL);
+  if (hresp.getSelectedButton() === ui.Button.OK) {
+    var hk = hresp.getResponseText().trim();
+    if (hk && hk.length > 8) {
+      props.setProperty(hunterKeyName, hk);
+      ui.alert('Hunter.io key saved.');
+    }
+  }
+
+  // LOR Drive ID
+  var lorKeyName = (CONFIG.PROPERTY_KEYS && CONFIG.PROPERTY_KEYS.LOR_DRIVE_ID) || 'LOR_DRIVE_ID';
+  var existingLor = props.getProperty(lorKeyName);
+  var lorMsg = existingLor
+    ? 'LOR Drive ID is set (' + existingLor.substring(0, 12) + '...). Paste a new ID to replace.'
+    : 'Paste the Drive file ID for your Letter of Recommendation PDF.\n\nTo get it: open the LOR in Drive → Share → Copy link → take the segment between /d/ and /view.';
+  var lresp = ui.prompt('LOR Drive ID', lorMsg, ui.ButtonSet.OK_CANCEL);
+  if (lresp.getSelectedButton() === ui.Button.OK) {
+    var lid = lresp.getResponseText().trim();
+    if (lid && lid.length > 10) {
+      props.setProperty(lorKeyName, lid);
+      ui.alert('LOR Drive ID saved.');
+    }
+  }
+
+  // Web App secret — auto-generate if not set
+  var secKeyName = (CONFIG.PROPERTY_KEYS && CONFIG.PROPERTY_KEYS.AUTOMAIL_WEBAPP_SECRET) || 'AUTOMAIL_WEBAPP_SECRET';
+  var existingSec = props.getProperty(secKeyName);
+  if (!existingSec) {
+    var newSec = Utilities.getUuid();
+    props.setProperty(secKeyName, newSec);
+    ui.alert(
+      'Web App secret generated',
+      'A shared secret has been generated for the share-target Web App.\n\n' +
+      'You DO NOT need to memorize it — it lives in Script Properties.\n\n' +
+      'When you deploy the Web App (Tools → Deploy → New deployment → Web app), the URL is what you paste into:\n' +
+      '  • Chrome extension popup → Settings → AutoMail Pipeline\n' +
+      '  • PWA index.html configuration\n\n' +
+      'Both clients send the secret automatically once you save it via the popup.\n\n' +
+      'To rotate the secret later, run this menu item again.',
+      ui.ButtonSet.OK
+    );
+  } else {
+    ui.alert('Web App secret already set (length ' + existingSec.length + '). Keeping existing value.');
+  }
+}
+
+/**
+ * Headless bootstrap — invoked via `clasp run _bootstrapSecrets --params [...]`.
+ * Order: [reoonApiKey, lorDriveId, webAppSecret?]. webAppSecret auto-generates if omitted.
+ *
+ * @param {string} reoonApiKey
+ * @param {string} lorDriveId
+ * @param {string} [webAppSecret]
+ * @returns {Object} status report
+ */
+function _bootstrapSecrets(reoonApiKey, lorDriveId, webAppSecret) {
+  var props = PropertiesService.getScriptProperties();
+  var report = { reoon: false, lor: false, secret: false };
+
+  var keys = (CONFIG.PROPERTY_KEYS) || {
+    REOON_API_KEY: 'REOON_API_KEY',
+    LOR_DRIVE_ID: 'LOR_DRIVE_ID',
+    AUTOMAIL_WEBAPP_SECRET: 'AUTOMAIL_WEBAPP_SECRET'
+  };
+
+  if (reoonApiKey && typeof reoonApiKey === 'string' && reoonApiKey.length > 8) {
+    props.setProperty(keys.REOON_API_KEY, reoonApiKey.trim());
+    report.reoon = true;
+  }
+  if (lorDriveId && typeof lorDriveId === 'string' && lorDriveId.length > 10) {
+    props.setProperty(keys.LOR_DRIVE_ID, lorDriveId.trim());
+    report.lor = true;
+  }
+  var sec = (webAppSecret && webAppSecret.length > 16) ? webAppSecret : Utilities.getUuid();
+  if (!props.getProperty(keys.AUTOMAIL_WEBAPP_SECRET)) {
+    props.setProperty(keys.AUTOMAIL_WEBAPP_SECRET, sec);
+    report.secret = true;
+  } else {
+    report.secret = 'kept_existing';
+  }
+
+  Logger.log('[Bootstrap] ' + JSON.stringify(report));
+  return report;
+}
+
 // ─── MENU ACTIONS ──────────────────────────────────────────
 
 /**
@@ -247,7 +397,9 @@ function menuCreateDraftCurrentRow() {
     var result = createDraft(lead, lead.subjectLine, lead.emailBody, { variantId: resumeVariantId });
 
     if (result.success) {
-      updateLeadFields(rowNum, { DRAFT_ID: result.draftId, STATUS: STATUS.DRAFT_CREATED });
+      // PATCH Phase 8 (F-10 fix): URL-keyed write protects against Sheet2 desync.
+      var _menuOpts = lead.linkedinUrl ? { verifyUrl: lead.linkedinUrl } : undefined;
+      updateLeadFields(rowNum, { DRAFT_ID: result.draftId, STATUS: STATUS.DRAFT_CREATED }, _menuOpts);
       ui.alert('Draft Created', 'Gmail draft created. ID: ' + result.draftId + '\nCheck your Gmail Drafts folder.', ui.ButtonSet.OK);
     } else {
       ui.alert('Error', 'Draft creation failed: ' + result.error, ui.ButtonSet.OK);
@@ -507,6 +659,38 @@ function menuShowDashboard() {
   text += '  Product: ' + (props.getProperty('RESUME_DRIVE_ID_PRODUCT') ? 'SET' : 'NOT SET') + '\n';
 
   SpreadsheetApp.getUi().alert('Pipeline Dashboard', text, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+// ─── WARM-KEEPER MENU (PATCH 2026-05-15) ───────────────────────────
+//
+// One-click installer for the WebApp warm-keeper trigger. Run once after
+// deployment to eliminate the APK Tracking-tab cold-start timeout
+// ("Couldn't load tracking data" flash on first open).
+function menuInstallWarmKeeper() {
+  var ui = SpreadsheetApp.getUi();
+  try {
+    if (typeof installWebAppWarmKeeperTrigger !== 'function') {
+      ui.alert('WarmKeeper unavailable',
+        'installWebAppWarmKeeperTrigger() is missing — pull the latest BatchProcessor.gs and try again.',
+        ui.ButtonSet.OK);
+      return;
+    }
+    var result = installWebAppWarmKeeperTrigger();
+    var url = '';
+    try { url = ScriptApp.getService().getUrl() || '(not deployed yet)'; } catch (_) {}
+    ui.alert('Warm-keeper trigger',
+      'Status: ' + result + '\n\n' +
+      'The trigger pings the WebApp every 5 min so the V8 container stays\n' +
+      'warm. APK Tracking tab will load entries on first open without\n' +
+      'showing the "Couldn\'t load" timeout flash.\n\n' +
+      'WebApp URL it pings:\n' + url + '\n\n' +
+      'Cost: ~288 trivial GETs/day = ~1.5% of the daily UrlFetchApp quota.\n\n' +
+      'To remove later: AutoMail Pipeline menu → "Remove All Triggers"\n' +
+      '(or in Apps Script editor → Triggers → delete webAppWarmKeeper row).',
+      ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('Warm-keeper install failed', e.message, ui.ButtonSet.OK);
+  }
 }
 
 // ─── HELPERS ───────────────────────────────────────────────

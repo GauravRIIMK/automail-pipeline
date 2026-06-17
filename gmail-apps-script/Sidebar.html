@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AutoMail Pipeline</title>
+  <style>
+    /* ── CSS Variables ── */
+    :root {
+      --color-primary:       #0b66c3;
+      --color-primary-light: #e8f0fb;
+      --color-bg:            #ffffff;
+      --color-surface:       #f8f9fa;
+      --color-border:        #e8eaed;
+      --color-text:          #202124;
+      --color-text-secondary:#5f6368;
+      --color-bar-bg:        #e8eaed;
+
+      --status-NEW:                  #888888;
+      --status-RESEARCH_DONE:        #0b66c3;
+      --status-REVIEW:               #f9a825;
+      --status-DRAFT_CREATED:        #0b66c3;
+      --status-SENT:                 #188038;
+      --status-RESPONDED:            #5e35b1;
+      --status-ERROR:                #d93025;
+      --status-NEEDS_EMAIL:          #d93025;
+      --status-NEEDS_EMAIL_REVIEW:   #f9a825;
+
+      --radius:  6px;
+      --gap:     10px;
+      --font:    'Roboto', 'Segoe UI', system-ui, sans-serif;
+    }
+
+    /* ── Reset / Base ── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      font-size: 13px;
+      color: var(--color-text);
+      background: var(--color-bg);
+      width: 300px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      padding: 12px;
+      gap: 14px;
+      overflow-x: hidden;
+    }
+
+    /* ── Section card ── */
+    .card {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius);
+      padding: 12px;
+    }
+
+    .card-title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--color-text-secondary);
+      margin-bottom: 10px;
+    }
+
+    /* ── Quota section ── */
+    .quota-numbers {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 6px;
+    }
+
+    .quota-label {
+      font-size: 13px;
+      color: var(--color-text);
+    }
+
+    .quota-fraction {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--color-primary);
+      line-height: 1;
+    }
+
+    .quota-remaining {
+      font-size: 11px;
+      color: var(--color-text-secondary);
+    }
+
+    .progress-track {
+      height: 8px;
+      background: var(--color-bar-bg);
+      border-radius: 99px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--color-primary);
+      border-radius: 99px;
+      width: 0%;
+      transition: width 0.5s ease;
+    }
+
+    /* ── Status list ── */
+    .status-list {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    .status-row:last-child {
+      border-bottom: none;
+    }
+
+    .status-name {
+      font-size: 12px;
+      color: var(--color-text);
+      flex: 1;
+    }
+
+    .status-bar-wrap {
+      flex: 0 0 80px;
+      height: 4px;
+      background: var(--color-bar-bg);
+      border-radius: 99px;
+      overflow: hidden;
+      margin: 0 8px;
+    }
+
+    .status-bar-fill {
+      height: 100%;
+      border-radius: 99px;
+      width: 0%;
+      transition: width 0.4s ease;
+    }
+
+    .status-badge {
+      font-size: 11px;
+      font-weight: 700;
+      min-width: 22px;
+      text-align: right;
+      color: var(--color-text-secondary);
+    }
+
+    /* ── Action grid ── */
+    .action-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--gap);
+    }
+
+    .btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      padding: 8px 6px;
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius);
+      background: var(--color-bg);
+      color: var(--color-primary);
+      font-family: var(--font);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+      position: relative;
+    }
+
+    .btn:hover:not(:disabled) {
+      background: var(--color-primary-light);
+      border-color: var(--color-primary);
+    }
+
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: var(--color-primary);
+      color: #ffffff;
+      border-color: var(--color-primary);
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: #0954a5;
+      border-color: #0954a5;
+    }
+
+    /* ── Spinner inside button ── */
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .spinner {
+      display: none;
+      width: 12px;
+      height: 12px;
+      border: 2px solid currentColor;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      flex-shrink: 0;
+    }
+
+    .btn.loading .btn-icon { display: none; }
+    .btn.loading .spinner  { display: inline-block; }
+    .btn.loading .btn-text { opacity: 0.7; }
+
+    /* ── Diagnostics block ── */
+    .diag-wrap {
+      display: none;
+      margin-top: 10px;
+    }
+
+    .diag-wrap.visible { display: block; }
+
+    .diag-pre {
+      font-family: 'Roboto Mono', 'Courier New', monospace;
+      font-size: 10px;
+      line-height: 1.5;
+      color: var(--color-text);
+      background: var(--color-bg);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius);
+      padding: 8px;
+      max-height: 220px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    /* ── Error banner ── */
+    .error-banner {
+      display: none;
+      background: #fce8e6;
+      border: 1px solid #f5c6c2;
+      border-radius: var(--radius);
+      padding: 8px 10px;
+      font-size: 11px;
+      color: #c5221f;
+      word-break: break-word;
+    }
+
+    .error-banner.visible { display: block; }
+
+    /* ── Footer ── */
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-top: 4px;
+    }
+
+    .footer-ts {
+      font-size: 10px;
+      color: var(--color-text-secondary);
+    }
+
+    .footer-refresh {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: var(--color-text-secondary);
+      font-size: 13px;
+      line-height: 1;
+      padding: 2px 4px;
+      border-radius: 3px;
+      transition: color 0.15s, background 0.15s;
+    }
+
+    .footer-refresh:hover { color: var(--color-primary); background: var(--color-primary-light); }
+
+    /* ── Skeleton loader lines ── */
+    .skeleton {
+      background: linear-gradient(90deg, #e8eaed 25%, #f8f9fa 50%, #e8eaed 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.2s infinite;
+      border-radius: 4px;
+      height: 12px;
+      width: 100%;
+      display: block;
+    }
+
+    @keyframes shimmer { to { background-position: -200% 0; } }
+
+    .skeleton + .skeleton { margin-top: 6px; }
+  </style>
+</head>
+<body>
+
+  <!-- ── Quota Section ── -->
+  <div class="card" id="quota-card">
+    <div class="card-title">Daily Draft Quota</div>
+    <div id="quota-content">
+      <span class="skeleton" style="width:70%; height:20px; margin-bottom:8px;"></span>
+      <span class="skeleton" style="height:8px;"></span>
+    </div>
+  </div>
+
+  <!-- ── Lead Status Section ── -->
+  <div class="card" id="status-card">
+    <div class="card-title">Lead Status Counts</div>
+    <div id="status-content">
+      <span class="skeleton"></span>
+      <span class="skeleton" style="width:85%;"></span>
+      <span class="skeleton" style="width:90%;"></span>
+      <span class="skeleton" style="width:75%;"></span>
+    </div>
+  </div>
+
+  <!-- ── Quick Actions ── -->
+  <div class="card">
+    <div class="card-title">Quick Actions</div>
+    <div class="action-grid">
+
+      <button class="btn btn-primary" id="btn-run" onclick="runBatch()">
+        <span class="spinner"></span>
+        <span class="btn-icon">&#9654;</span>
+        <span class="btn-text">Run Next Batch</span>
+      </button>
+
+      <button class="btn" id="btn-refresh" onclick="refresh()">
+        <span class="spinner"></span>
+        <span class="btn-icon">&#x1F504;</span>
+        <span class="btn-text">Refresh</span>
+      </button>
+
+      <button class="btn" id="btn-diag" onclick="toggleDiagnostics()">
+        <span class="spinner"></span>
+        <span class="btn-icon">&#x1F4CA;</span>
+        <span class="btn-text">Diagnostics</span>
+      </button>
+
+      <button class="btn" id="btn-help" onclick="showHelp()">
+        <span class="btn-icon">&#x2753;</span>
+        <span class="btn-text">Help</span>
+      </button>
+
+    </div>
+
+    <!-- Inline diagnostics block -->
+    <div class="diag-wrap" id="diag-wrap">
+      <pre class="diag-pre" id="diag-pre">Loading diagnostics…</pre>
+    </div>
+  </div>
+
+  <!-- ── Error Banner ── -->
+  <div class="error-banner" id="error-banner"></div>
+
+  <!-- ── Footer ── -->
+  <div class="footer">
+    <span class="footer-ts" id="footer-ts">Last updated: —</span>
+    <button class="footer-refresh" title="Refresh now" onclick="refresh()">&#x21BB;</button>
+  </div>
+
+
+  <script>
+    // ── Status display order and colour map ──
+    var STATUS_ORDER = [
+      'NEW',
+      'NEEDS_EMAIL',
+      'NEEDS_EMAIL_REVIEW',
+      'RESEARCH_DONE',
+      'REVIEW',
+      'DRAFT_CREATED',
+      'SENT',
+      'RESPONDED',
+      'ERROR'
+    ];
+
+    var STATUS_COLORS = {
+      NEW:                 '#888888',
+      RESEARCH_DONE:       '#0b66c3',
+      REVIEW:              '#f9a825',
+      DRAFT_CREATED:       '#0b66c3',
+      SENT:                '#188038',
+      RESPONDED:           '#5e35b1',
+      ERROR:               '#d93025',
+      NEEDS_EMAIL:         '#d93025',
+      NEEDS_EMAIL_REVIEW:  '#f9a825'
+    };
+
+    // ── Auto-refresh timer ──
+    var autoRefreshInterval = setInterval(refresh, 60000);
+    window.addEventListener('unload', function () {
+      clearInterval(autoRefreshInterval);
+    });
+
+    // ── Diagnostics panel state ──
+    var diagVisible   = false;
+    var diagLoaded    = false;
+
+    // ── Error display ──
+    function showError(err) {
+      var banner = document.getElementById('error-banner');
+      banner.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
+      banner.classList.add('visible');
+      setTimeout(function () { banner.classList.remove('visible'); }, 8000);
+    }
+
+    function clearError() {
+      document.getElementById('error-banner').classList.remove('visible');
+    }
+
+    // ── Button loading state helpers ──
+    function setLoading(btnId, loading) {
+      var btn = document.getElementById(btnId);
+      if (!btn) return;
+      if (loading) {
+        btn.classList.add('loading');
+        btn.disabled = true;
+      } else {
+        btn.classList.remove('loading');
+        btn.disabled = false;
+      }
+    }
+
+    // ── Footer timestamp ──
+    function updateTimestamp() {
+      var now  = new Date();
+      var hh   = String(now.getHours()).padStart(2, '0');
+      var mm   = String(now.getMinutes()).padStart(2, '0');
+      var ss   = String(now.getSeconds()).padStart(2, '0');
+      document.getElementById('footer-ts').textContent =
+        'Last updated: ' + hh + ':' + mm + ':' + ss;
+    }
+
+    // ── Render quota card ──
+    function renderQuota(data) {
+      var count     = data.count     || 0;
+      var limit     = data.limit     || 25;
+      var remaining = data.remaining !== undefined ? data.remaining : Math.max(0, limit - count);
+      var pct       = limit > 0 ? Math.min(100, Math.round((count / limit) * 100)) : 0;
+
+      var html =
+        '<div class="quota-numbers">' +
+          '<span class="quota-label">Drafts today</span>' +
+          '<span class="quota-fraction">' + count + ' / ' + limit + '</span>' +
+        '</div>' +
+        '<div class="progress-track">' +
+          '<div class="progress-fill" id="quota-bar"></div>' +
+        '</div>' +
+        '<div style="text-align:right; margin-top:4px;">' +
+          '<span class="quota-remaining">' + remaining + ' remaining</span>' +
+        '</div>';
+
+      document.getElementById('quota-content').innerHTML = html;
+
+      // Trigger CSS transition on next frame
+      requestAnimationFrame(function () {
+        var bar = document.getElementById('quota-bar');
+        if (bar) bar.style.width = pct + '%';
+      });
+    }
+
+    // ── Render status list ──
+    function renderStatuses(counts) {
+      // Determine max count for relative bar widths
+      var allKeys = STATUS_ORDER.slice();
+      // Also include any status keys returned that aren't in our order list
+      Object.keys(counts).forEach(function (k) {
+        if (allKeys.indexOf(k) === -1) allKeys.push(k);
+      });
+
+      var maxCount = 1;
+      allKeys.forEach(function (k) {
+        if ((counts[k] || 0) > maxCount) maxCount = counts[k];
+      });
+
+      var html = '<div class="status-list">';
+      STATUS_ORDER.forEach(function (status) {
+        var n     = counts[status] || 0;
+        var color = STATUS_COLORS[status] || '#888';
+        var pct   = maxCount > 0 ? Math.round((n / maxCount) * 100) : 0;
+        var label = status.replace(/_/g, '_​'); // allow wrap at underscores
+
+        html +=
+          '<div class="status-row">' +
+            '<span class="status-name">' + status + '</span>' +
+            '<div class="status-bar-wrap">' +
+              '<div class="status-bar-fill" style="background:' + color +
+                '; width:' + pct + '%"></div>' +
+            '</div>' +
+            '<span class="status-badge" style="color:' + color + '">' + n + '</span>' +
+          '</div>';
+      });
+      html += '</div>';
+
+      document.getElementById('status-content').innerHTML = html;
+    }
+
+    // ── Refresh: load quota + status counts ──
+    function refresh() {
+      clearError();
+      setLoading('btn-refresh', true);
+
+      // Track completion of both calls
+      var pending = 2;
+      function done() {
+        pending--;
+        if (pending <= 0) {
+          setLoading('btn-refresh', false);
+          updateTimestamp();
+        }
+      }
+
+      google.script.run
+        .withSuccessHandler(function (data) { renderQuota(data); done(); })
+        .withFailureHandler(function (err)  { showError(err); done(); })
+        .getDailyDraftStatus();
+
+      google.script.run
+        .withSuccessHandler(function (data) { renderStatuses(data); done(); })
+        .withFailureHandler(function (err)  { showError(err); done(); })
+        .getLeadStatusCounts();
+
+      // If diagnostics panel is open, reload it too
+      if (diagVisible) {
+        loadDiagnostics();
+      }
+    }
+
+    // ── Run Next Batch ──
+    function runBatch() {
+      clearError();
+      setLoading('btn-run', true);
+
+      google.script.run
+        .withSuccessHandler(function () {
+          setLoading('btn-run', false);
+          // Pause briefly then refresh status counts
+          setTimeout(refresh, 1500);
+        })
+        .withFailureHandler(function (err) {
+          setLoading('btn-run', false);
+          showError(err);
+        })
+        .processNextBatch();
+    }
+
+    // ── Diagnostics: toggle + lazy-load ──
+    function toggleDiagnostics() {
+      var wrap = document.getElementById('diag-wrap');
+      diagVisible = !diagVisible;
+
+      if (diagVisible) {
+        wrap.classList.add('visible');
+        loadDiagnostics();
+      } else {
+        wrap.classList.remove('visible');
+        setLoading('btn-diag', false);
+      }
+    }
+
+    function loadDiagnostics() {
+      var pre = document.getElementById('diag-pre');
+      pre.textContent = 'Loading diagnostics…';
+      setLoading('btn-diag', true);
+
+      google.script.run
+        .withSuccessHandler(function (text) {
+          pre.textContent = text || '(no data)';
+          setLoading('btn-diag', false);
+        })
+        .withFailureHandler(function (err) {
+          pre.textContent = 'Failed to load diagnostics.';
+          setLoading('btn-diag', false);
+          showError(err);
+        })
+        .getRunDiagnostics(3);
+    }
+
+    // ── Help ──
+    function showHelp() {
+      var helpText =
+        'AutoMail Pipeline Dashboard\n\n' +
+        'Run Next Batch  — Processes the next set of NEW leads\n' +
+        '                  through Research → Classify → Draft.\n\n' +
+        'Refresh         — Reloads quota and status counts now.\n' +
+        '                  Also runs automatically every 60 s.\n\n' +
+        'Diagnostics     — Shows the last 3 pipeline run reports\n' +
+        '                  with error details inline.\n\n' +
+        'Status colours:\n' +
+        '  NEW / grey          — Awaiting processing\n' +
+        '  RESEARCH_DONE / blue — Research complete\n' +
+        '  REVIEW / amber      — Needs manual review\n' +
+        '  DRAFT_CREATED / blue — Draft ready in Gmail\n' +
+        '  SENT / green        — Email sent\n' +
+        '  RESPONDED / purple  — Lead replied\n' +
+        '  ERROR / red         — Processing failed\n' +
+        '  NEEDS_EMAIL / red   — Email missing\n' +
+        '  NEEDS_EMAIL_REVIEW / amber — Email needs review\n';
+
+      var pre = document.getElementById('diag-pre');
+      var wrap = document.getElementById('diag-wrap');
+      pre.textContent = helpText;
+      diagVisible = true;
+      wrap.classList.add('visible');
+    }
+
+    // ── Initial load ──
+    refresh();
+  </script>
+</body>
+</html>

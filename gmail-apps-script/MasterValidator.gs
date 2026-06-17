@@ -90,7 +90,8 @@ function masterValidate(subject, htmlBody, lead, dossier, classification, resume
   }
 
   // ── Stage 4: Cold job-application framing (fatal for begging/sales) ─
-  var framingIssues = _checkColdJobFraming(plainText, normalized);
+  // Pass parsedComposition so the attachment-mention check can exclude closingResume.
+  var framingIssues = _checkColdJobFraming(plainText, normalized, parsedComposition);
   if (framingIssues.fatal.length > 0) {
     fatalIssues = fatalIssues.concat(framingIssues.fatal);
     scoreDeductions += 0.20;
@@ -99,7 +100,14 @@ function masterValidate(subject, htmlBody, lead, dossier, classification, resume
   warnings = warnings.concat(framingIssues.warnings);
 
   // ── Stage 5: Event grounding — numbers/proper-nouns in hook ─────────
-  var groundingIssues = _checkEventGrounding(plainText, dossier);
+  // Scope ONLY to the hook paragraph when available (BULLET_V1 format puts
+  // Gaurav's verified resume metrics in the experience bullets, which are
+  // legitimately not in the lead's dossier — checking them as "ungrounded"
+  // generates false positives).
+  var hookZoneText = (parsedComposition && parsedComposition.hookParagraph)
+    ? parsedComposition.hookParagraph
+    : plainText;
+  var groundingIssues = _checkEventGrounding(hookZoneText, dossier);
   if (groundingIssues.length > 0) {
     // Grounding failures are warnings (not fatal) because dossier may not have
     // every hook fact even when it's real — but we still flag.
@@ -139,9 +147,18 @@ function masterValidate(subject, htmlBody, lead, dossier, classification, resume
   }
 
   // ── Stage 9: LLM critic pass (only if deterministic is clean enough) ─
+  //
+  // PATCH 2026-05-13 (D7 latency): also skip critic when the deterministic
+  // stages already produce a high score (scoreDeductions ≤ 0.10, meaning
+  // ≥0.90 composite). The critic adds ~10s of Claude latency and is
+  // most useful on borderline emails. For emails that already pass all
+  // 8 deterministic gates cleanly, the critic almost always agrees and
+  // saves a wasted round-trip. Borderline emails (score 0.75-0.90) still
+  // get the critic. Logged for telemetry so we can audit decisions.
   var criticDimensions = null;
   var criticUsed = false;
-  if (fatalIssues.length === 0) {
+  var deterministicScoreOk = (scoreDeductions <= 0.10);
+  if (fatalIssues.length === 0 && !deterministicScoreOk) {
     try {
       criticDimensions = _invokeLlmCritic(subject, plainText, lead, dossier, classification, resumeSelection);
       criticUsed = !!criticDimensions;
@@ -163,6 +180,10 @@ function masterValidate(subject, htmlBody, lead, dossier, classification, resume
     } catch (criticErr) {
       Logger.log('[MasterValidator] LLM critic pass failed (non-blocking): ' + criticErr.message);
     }
+  } else if (fatalIssues.length === 0 && deterministicScoreOk) {
+    // Telemetry: critic skipped because deterministic stages were clean.
+    // We expect to skip ~20% of emails this way.
+    Logger.log('[MasterValidator] Critic SKIPPED (deterministic score ≥0.90, no fatal issues) — saved ~10s');
   }
 
   // ── Final score + verdict ──────────────────────────────────────────
@@ -214,7 +235,10 @@ function _checkPlaceholderLeaks(subject, body) {
     { re: /\bTODO\b|\bTBD\b|\bFIXME\b|\bLOREM IPSUM\b/i, label: 'stub/placeholder text' },
     { re: /\bplaceholder\b/i, label: 'literal "placeholder" word' },
     { re: /\bXXX+\b/g, label: 'XXX marker' },
-    { re: /\.\.\.\s*fill in/i, label: '"fill in" instruction' }
+    { re: /\.\.\.\s*fill in/i, label: '"fill in" instruction' },
+    // PATCH `-eq8-content-fix` (#5): belt-and-suspenders for LLM refusal strings
+    // that somehow survive the composer's _quickValidate FATAL guard.
+    { re: /\b(there is no hook|no data available|no match found|as an ai\b|unable to (find|provide|generate)|insufficient data|i don'?t have)\b/i, label: 'LLM refusal/no-data string' }
   ];
   patterns.forEach(function(p) {
     var m = fullText.match(p.re);
@@ -314,8 +338,13 @@ function _checkRecency(plainText) {
 
 /**
  * Cold job-application framing checks. Returns {fatal, warnings}.
+ * @param {string} plainText - Full plain-text body (used for framing patterns)
+ * @param {string} normalized - Lowercased+whitespace-normalised version of plainText
+ * @param {Object} [parsedComposition] - Optional parsed composition fields; used to
+ *   exclude closingResume content from the attachment-mention check so that the
+ *   canonical "Resume attached for further context" closer doesn't trip the FATAL.
  */
-function _checkColdJobFraming(plainText, normalized) {
+function _checkColdJobFraming(plainText, normalized, parsedComposition) {
   var fatal = [];
   var warnings = [];
 
@@ -335,9 +364,29 @@ function _checkColdJobFraming(plainText, normalized) {
     }
   });
 
-  // Attachment mentions (already checked in _quickValidate but redundant belt here)
-  if (/\b(attached|attachment|please find|enclosed)\b/i.test(plainText) &&
-      !/\bnot attached\b/i.test(plainText)) {
+  // Build a scanText that EXCLUDES closingResume — the canonical template legitimately
+  // says "Resume attached for further context. Would welcome the chance..." there;
+  // flagging it as a body attachment-mention is a false positive.
+  // Also excludes closingResume from the em-dash check (defensive, for future templates).
+  var scanText = [
+    parsedComposition && parsedComposition.hookParagraph    ? parsedComposition.hookParagraph    : '',
+    parsedComposition && parsedComposition.bridgeSentence   ? parsedComposition.bridgeSentence   : '',
+    parsedComposition && parsedComposition.experienceBullets
+      ? (parsedComposition.experienceBullets || []).map(function(b) { return (b.label || '') + ': ' + (b.body || ''); }).join(' ')
+      : '',
+    parsedComposition && parsedComposition.currentRoleParagraph  ? parsedComposition.currentRoleParagraph  : '',
+    parsedComposition && parsedComposition.motivationParagraph   ? parsedComposition.motivationParagraph   : '',
+    parsedComposition && parsedComposition.closingLogistics      ? parsedComposition.closingLogistics      : ''
+    // EXCLUDED: parsedComposition.closingResume — the canonical template legitimately
+    // says "Resume attached for further context" here; don't flag it as
+    // self-mentioning attachment in the body.
+  ].join(' ');
+  // Fall back to full plainText when no parsedComposition is available (legacy callers)
+  var attachmentScanTarget = (parsedComposition ? scanText : plainText);
+
+  // Attachment mentions — check only the scoped body (not closingResume)
+  if (/\b(attached|attachment|please find|enclosed)\b/i.test(attachmentScanTarget) &&
+      !/\bnot attached\b/i.test(attachmentScanTarget)) {
     fatal.push('FATAL: Body mentions attachment — resume is auto-attached, do not reference it');
   }
 
@@ -366,7 +415,8 @@ function _checkEventGrounding(plainText, dossier) {
   // Serialize dossier to a searchable text blob
   var dossierBlob = JSON.stringify(dossier).toLowerCase();
 
-  // Extract currency+number tokens from first 200 chars (the hook zone)
+  // The caller now passes the scoped hook text (BULLET_V1) or full plainText
+  // (legacy). Take the first 250 chars in either case to keep the regex cheap.
   var hookZone = plainText.substring(0, 250).toLowerCase();
 
   // Find number patterns: "189%", "₹5.76 Cr", "$12M", "Series B", "120 employees"
@@ -475,8 +525,17 @@ function _checkHtmlStructure(html, parsedComposition) {
   var warnings = [];
   if (!html) { fatal.push('FATAL: HTML body is empty'); return { fatal: fatal, warnings: warnings }; }
 
-  // Banner image
-  if (html.indexOf('cid:emailBanner') < 0) {
+  // PATCH 2026-05-19: detect CXO_SHORT (Leadership Master Template) — it ships
+  // intentionally without a banner per Founder-Grade Playbook ("banners read
+  // junior to Director+"). Skip banner warning for CXO shape.
+  var _mvCxoBullets = (parsedComposition && Array.isArray(parsedComposition.experienceBullets))
+    ? parsedComposition.experienceBullets.length : 0;
+  var _mvIsCxoShort = (_mvCxoBullets === 0)
+    && !!(parsedComposition && parsedComposition.motivationParagraph
+          && parsedComposition.motivationParagraph.toString().trim());
+
+  // Banner image (STANDARD/HR only — CXO_SHORT deliberately omits banner)
+  if (!_mvIsCxoShort && html.indexOf('cid:emailBanner') < 0) {
     warnings.push('Structure: Banner image CID missing');
   }
 
@@ -528,11 +587,19 @@ function _checkHtmlStructure(html, parsedComposition) {
     fatal.push('FATAL: Unbalanced <div> tags (' + dOpen + ' open, ' + dClose + ' close)');
   }
 
-  // Em-dash / curly quotes
-  if (/[\u2014\u2015]/.test(html)) {
+  // Exclude closingResume from em-dash / curly-quote scan — future template variants
+  // may legitimately use these characters only in the closing resume sentence.
+  var htmlForEmDashCheck = html;
+  if (parsedComposition && parsedComposition.closingResume) {
+    var closingResumeEscaped = parsedComposition.closingResume.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    htmlForEmDashCheck = html.replace(new RegExp(closingResumeEscaped, 'g'), '');
+  }
+
+  // Em-dash / curly quotes (scoped to htmlForEmDashCheck, not full html)
+  if (/[\u2014\u2015]/.test(htmlForEmDashCheck)) {
     fatal.push('FATAL: Em-dash detected — must use " - " or plain hyphen');
   }
-  if (/[\u201C\u201D\u2018\u2019]/.test(html)) {
+  if (/[\u201C\u201D\u2018\u2019]/.test(htmlForEmDashCheck)) {
     warnings.push('Structure: Curly/smart quotes detected');
   }
 

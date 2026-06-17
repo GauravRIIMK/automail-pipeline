@@ -98,6 +98,42 @@ function _rowToLeadProfile(row, rowNum) {
   var organization = (row[c.ORGANIZATION - 1] || '').toString().trim();
   var email        = (row[c.EMAIL - 1] || '').toString().trim();
 
+  // ── COLUMN-SHIFT DETECTION (extension wrote 50-col row with timestamp at A) ──
+  // The Chrome extension's formatDataForGoogleSheets() puts ISO timestamp at col A,
+  // fullName at B, designation at C, organization at D, headline at E, email at F,
+  // profileUrl at G — a different order than our pipeline expects.
+  //
+  // Detect by: col A looks like an ISO 8601 timestamp (starts with YYYY-MM-DD).
+  // When detected, remap to canonical layout. This is non-destructive (we don't
+  // rewrite the sheet — just the in-memory profile).
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(linkedinUrl)) {
+    Logger.log('[SheetReader] Row ' + rowNum + ' detected extension column layout (timestamp at A) — remapping');
+    var origLinkedin   = (row[6] || '').toString().trim();        // col G = profileUrl in extension layout
+    var origDesignation = (row[c.HEADLINE - 1] || '').toString().trim();   // ext col C
+    var origOrg         = (row[c.DESIGNATION - 1] || '').toString().trim();// ext col D
+    var origHeadline    = (row[c.ORGANIZATION - 1] || '').toString().trim();// ext col E
+    linkedinUrl  = origLinkedin;
+    headline     = origHeadline;
+    designation  = origDesignation;
+    organization = origOrg;
+  }
+
+  // ── NAME VALIDATION — reject phone numbers, all-digit, junk strings ──
+  // Root cause of "Hi 9876543210," and "Hi ," bugs: when LinkedIn's name selector
+  // grabs a phone number or empty string, Claude either passes it through verbatim
+  // or our renderer falls back to an empty greeting.
+  //
+  // A real person name must have at least one alphabetic word ≥2 chars and not be
+  // dominated by digits. The pipeline downgrades bad names to '' so downstream
+  // greeting logic falls through to "Hi Team {Org}," / "Hi there,".
+  if (fullName && !_isLikelyValidName(fullName)) {
+    Logger.log('[SheetReader] Row ' + rowNum + ' WARNING: fullName "' + fullName + '" failed name validation — clearing for safe fallback');
+    // Stash raw value in notes-style field so the sidebar can flag it; clear name
+    // so prompt + greeting use safe org-based fallback
+    var origFullName = fullName;
+    fullName = '';
+  }
+
   // Skip rows with no name or email
   if (!fullName && !email) return null;
 
@@ -105,6 +141,26 @@ function _rowToLeadProfile(row, rowNum) {
   var nameParts = fullName.split(' ');
   var firstName = nameParts[0] || '';
   var lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : '';
+
+  // Defensive: even after primary validation, ensure firstName looks like a name.
+  // 2026-05-11 FIX: previous regex `^[A-Za-z][A-Za-z'.\-]+$` REJECTED non-Latin
+  // first names (South Asian with diacritics, European accents, Greek/Cyrillic,
+  // etc.) — clearing firstName for them, which then broke pattern-guess email
+  // generation. New regex accepts any Unicode letter class via /^\p{L}.../u
+  // plus apostrophes/dots/hyphens. Falls back to the old ASCII-only regex if the
+  // engine doesn't support \p{L} (extremely rare in V8).
+  if (firstName) {
+    var nameOK = false;
+    try {
+      // Unicode property escape — accepts Latin, Latin-Extended, Greek, Cyrillic,
+      // Devanagari, Arabic, CJK, Hangul, etc. — any "letter".
+      nameOK = /^\p{L}[\p{L}'.\-]*$/u.test(firstName);
+    } catch (_) {
+      // Engine without \p{L} support — fall back to old regex
+      nameOK = /^[A-Za-z][A-Za-z'.\-]*$/.test(firstName);
+    }
+    if (!nameOK) firstName = '';
+  }
 
   // Validation: warn if email doesn't look right
   if (email && email.indexOf('@') < 0) {
@@ -158,11 +214,18 @@ function _rowToLeadProfile(row, rowNum) {
     followupDates: (row[c.FOLLOWUP_DATES - 1] || '').toString().trim(),
     lastUpdated: (row[c.LAST_UPDATED - 1] || '').toString().trim(),
 
-    // Threading & enrichment (columns V-Y, added 2026-04)
+    // Threading & enrichment (columns V-Z, added 2026-04 / 2026-05)
     threadId: c.THREAD_ID ? (row[c.THREAD_ID - 1] || '').toString().trim() : '',
     rfc822MessageId: c.RFC822_MESSAGE_ID ? (row[c.RFC822_MESSAGE_ID - 1] || '').toString().trim() : '',
     enrichedEmail: c.ENRICHED_EMAIL ? (row[c.ENRICHED_EMAIL - 1] || '').toString().trim() : '',
-    emailSource: c.EMAIL_SOURCE ? (row[c.EMAIL_SOURCE - 1] || '').toString().trim() : ''
+    emailSource: c.EMAIL_SOURCE ? (row[c.EMAIL_SOURCE - 1] || '').toString().trim() : '',
+    emailConfidence: c.EMAIL_CONFIDENCE ? parseFloat(row[c.EMAIL_CONFIDENCE - 1]) || 0 : 0,
+
+    // PATCH 2026-05-16 (Option 5 / Sub-option 2): TARGET_ROLE column AA.
+    // Empty → composer uses informational framing (default for all leads).
+    // Non-empty → composer switches to applying framing referencing this role.
+    // Sheet2-only column; not present in Sheet1 / not propagated by =UNIQUE().
+    targetRole: c.TARGET_ROLE ? (row[c.TARGET_ROLE - 1] || '').toString().trim() : ''
   };
 }
 
@@ -230,12 +293,102 @@ function updateLeadStatus(rowNum, newStatus) {
 
 /**
  * Writes multiple pipeline fields for a lead back to the sheet.
+ *
+ * PATCH 2026-05-18: third parameter `opts.verifyUrl` enables defensive
+ * row-identity verification. When set, this function first checks that
+ * the row's current LINKEDIN_URL matches `opts.verifyUrl`; if it doesn't
+ * (because Sheet1 changed and UNIQUE() shifted rows), it re-locates the
+ * row by URL via findRowByLinkedinUrl() and writes there instead.
+ *
+ * This guards against the Sheet1↔Sheet2 desync class of bug where a
+ * batch process reads lead@rowNum, makes API calls (during which Sheet1
+ * mutates and rows shift), then writes state back to the original rowNum
+ * — which is now a DIFFERENT person. Symptom: Sheet2Realigner finds
+ * mismatched state across many rows.
+ *
+ * Backwards compatible: callers that don't pass `opts` get the original
+ * behavior (write to rowNum, no verification). New callers should pass
+ * `{ verifyUrl: lead.linkedinUrl, verifyUid: lead.leadUid }` to opt into protection.
+ *
+ * PATCH Phase 3 (2026-05-20 remediation p3-leaduid): added `opts.verifyUid`.
+ * When set, this function also checks the row's current LEAD_UID column.
+ *   - Row has UID + matches: write proceeds
+ *   - Row has UID + mismatch: REJECT (different lead now in this slot)
+ *   - Row has no UID (legacy): write proceeds (backward compat — will be
+ *     populated by backfillLeadUids() asynchronously)
+ *   - opts.verifyUid omitted: no UID check (existing callers unchanged)
+ *
  * @param {number} rowNum
  * @param {Object} updates - Key-value pairs matching CONFIG.COLUMNS keys
+ * @param {Object} [opts]
+ *   {string} verifyUrl   — linkedinUrl this write is intended for; aborts
+ *                          or re-locates if mismatch
+ *   {string} verifyUid   — leadUid this write is intended for; REJECTS write
+ *                          if row's stored UID exists and differs (Phase 3.5)
+ *   {boolean} createIfMissing — if true and re-location fails, do nothing
+ *                          quietly; if false, log a warning. Default false.
  */
-function updateLeadFields(rowNum, updates) {
+function updateLeadFields(rowNum, updates, opts) {
   var sheet = _getDataSheet();
   var c = CONFIG.COLUMNS;
+  opts = opts || {};
+
+  // ── Defensive row-identity check (PATCH 2026-05-18) ──
+  if (opts.verifyUrl) {
+    var expectedUrl = (opts.verifyUrl || '').toString().toLowerCase().trim();
+    var currentUrl = '';
+    try {
+      currentUrl = (sheet.getRange(rowNum, c.LINKEDIN_URL).getValue() || '').toString().toLowerCase().trim();
+    } catch (_) {}
+    if (expectedUrl && currentUrl && currentUrl !== expectedUrl) {
+      Logger.log('[updateLeadFields] ROW SHIFT DETECTED at row ' + rowNum +
+                 ': expected ' + expectedUrl + ' but row currently has ' + currentUrl +
+                 ' — attempting re-locate by URL');
+      var newRow = findRowByLinkedinUrl(opts.verifyUrl);
+      if (newRow > 0) {
+        Logger.log('[updateLeadFields] Re-located ' + expectedUrl + ' to row ' + newRow +
+                   ' (was row ' + rowNum + ')');
+        rowNum = newRow;
+      } else {
+        Logger.log('[updateLeadFields] ABORT: could not find row for ' + expectedUrl +
+                   ' (was supposed to be at row ' + rowNum + '). Updates dropped: ' +
+                   Object.keys(updates).join(','));
+        return false;
+      }
+    } else if (expectedUrl && !currentUrl) {
+      // Row exists but its LINKEDIN_URL is blank — probably a deleted row.
+      // Re-locate before writing.
+      var newRow2 = findRowByLinkedinUrl(opts.verifyUrl);
+      if (newRow2 > 0) {
+        Logger.log('[updateLeadFields] Row ' + rowNum + ' has blank URL; re-located ' +
+                   expectedUrl + ' to row ' + newRow2);
+        rowNum = newRow2;
+      }
+    }
+  }
+
+  // ── Defensive UID check (PATCH Phase 3 p3-leaduid) ──
+  // Test: verifyUid_mismatched_uid_rejects_write
+  if (opts.verifyUid && c.LEAD_UID) {
+    var expectedUid = (opts.verifyUid || '').toString().trim();
+    var currentUid = '';
+    try {
+      currentUid = (sheet.getRange(rowNum, c.LEAD_UID).getValue() || '').toString().trim();
+    } catch (_) {}
+    if (expectedUid && currentUid && currentUid !== expectedUid) {
+      Logger.log('[updateLeadFields] UID MISMATCH at row ' + rowNum +
+                 ': expected ' + expectedUid + ' but row has ' + currentUid +
+                 ' — REJECTING write (different lead identity now in this slot). ' +
+                 'Updates dropped: ' + Object.keys(updates).join(','));
+      return false;
+    }
+    // Legacy row (currentUid empty): allow write — will be populated by
+    // backfillLeadUids() asynchronously. Document but do not block.
+    if (expectedUid && !currentUid) {
+      Logger.log('[updateLeadFields] Row ' + rowNum + ' has no stored UID; ' +
+                 'legacy compat mode — allowing write (expected UID was ' + expectedUid + ')');
+    }
+  }
 
   for (var key in updates) {
     if (c[key] && updates[key] !== undefined) {
@@ -244,6 +397,31 @@ function updateLeadFields(rowNum, updates) {
   }
   // Always update timestamp
   sheet.getRange(rowNum, c.LAST_UPDATED).setValue(new Date().toISOString());
+  return true;
+}
+
+/**
+ * PATCH 2026-05-18: linear lookup of a row by its LinkedIn URL.
+ *
+ * Used by updateLeadFields' defensive identity check (when opts.verifyUrl
+ * is passed) and by realignSheet2State. O(N) over Sheet2's row count which
+ * is fine for this app's volume (typically <500 rows).
+ *
+ * @param {string} url - LinkedIn URL to find
+ * @returns {number} 1-indexed row number, or -1 if not found
+ */
+function findRowByLinkedinUrl(url) {
+  if (!url) return -1;
+  var sheet = _getDataSheet();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return -1;
+  var urls = sheet.getRange(2, CONFIG.COLUMNS.LINKEDIN_URL, lastRow - 1, 1).getValues();
+  var target = url.toString().toLowerCase().trim();
+  for (var i = 0; i < urls.length; i++) {
+    var cell = (urls[i][0] || '').toString().toLowerCase().trim();
+    if (cell === target) return i + 2;  // header is row 1, data starts at row 2
+  }
+  return -1;
 }
 
 /**
@@ -315,11 +493,12 @@ function initializePipelineColumns() {
   headers[c.SENT_DATE] = 'Sent_Date';
   headers[c.FOLLOWUP_DATES] = 'Followup_Dates';
   headers[c.LAST_UPDATED] = 'Last_Updated';
-  // Threading & enrichment columns V-Y (added 2026-04 for follow-up threading + email verification)
+  // Threading & enrichment columns V-Z (added 2026-04/05 for threading + verification + confidence)
   if (c.THREAD_ID)         headers[c.THREAD_ID]         = 'Thread_ID';
   if (c.RFC822_MESSAGE_ID) headers[c.RFC822_MESSAGE_ID] = 'RFC822_Message_ID';
   if (c.ENRICHED_EMAIL)    headers[c.ENRICHED_EMAIL]    = 'Enriched_Email';
   if (c.EMAIL_SOURCE)      headers[c.EMAIL_SOURCE]      = 'Email_Source';
+  if (c.EMAIL_CONFIDENCE)  headers[c.EMAIL_CONFIDENCE]  = 'Email_Confidence';
 
   for (var col in headers) {
     sheet.getRange(1, parseInt(col)).setValue(headers[col]);
@@ -329,13 +508,67 @@ function initializePipelineColumns() {
   sheet.getRange(1, 1, 1, colCount).setFontWeight('bold');
 
   Logger.log('Pipeline columns A-' + _colIndexToLetter(colCount) + ' initialized in Sheet2');
-  SpreadsheetApp.getUi().alert(
-    'All ' + colCount + ' pipeline columns (A-' + _colIndexToLetter(colCount) + ') initialized in Sheet2.\n\n' +
-    'Input columns A-F:\n' +
-    'A: LinkedIn_URL | B: Full_Name | C: Headline | D: Designation | E: Organization | F: Email\n\n' +
-    'Threading columns V-Y:\n' +
-    'V: Thread_ID | W: RFC822_Message_ID | X: Enriched_Email | Y: Email_Source'
-  );
+  // UI alert is best-effort — if running headlessly via clasp run, getUi() throws.
+  try {
+    SpreadsheetApp.getUi().alert(
+      'All ' + colCount + ' pipeline columns (A-' + _colIndexToLetter(colCount) + ') initialized in Sheet2.\n\n' +
+      'Input columns A-F:\n' +
+      'A: LinkedIn_URL | B: Full_Name | C: Headline | D: Designation | E: Organization | F: Email\n\n' +
+      'Threading + enrichment columns V-Z:\n' +
+      'V: Thread_ID | W: RFC822_Message_ID | X: Enriched_Email | Y: Email_Source | Z: Email_Confidence'
+    );
+  } catch (uiErr) {
+    Logger.log('[SheetReader] initializePipelineColumns: UI alert skipped (headless context)');
+  }
+}
+
+/**
+ * Heuristic name validator. Returns true if the string plausibly represents a
+ * real person's name (Latin alphabet, optional apostrophes/hyphens/dots, 1-4
+ * words, no all-digit components, no obvious phone/URL patterns).
+ *
+ * Catches:
+ *   "9876543210"           → false (all digits — phone scrape)
+ *   "+91 98765 43210"      → false (digits + spaces)
+ *   "John Doe"             → true
+ *   "Mary-Anne O'Brien"    → true
+ *   "https://..."          → false
+ *   "500+ connections"     → false (digit-heavy)
+ *   "Verified · He/Him"    → false (special chars only after non-alpha leading)
+ *   ""                     → false
+ *
+ * @param {string} s
+ * @returns {boolean}
+ */
+function _isLikelyValidName(s) {
+  if (!s) return false;
+  var t = s.toString().trim();
+  if (t.length < 2 || t.length > 80) return false;
+
+  // Reject if any URL/email/phone pattern dominates
+  if (/^https?:\/\//i.test(t)) return false;
+  if (/@/.test(t)) return false;
+  if (/[\d]{5,}/.test(t)) return false;        // 5+ contiguous digits = phone-ish
+  if (/\+\d{1,3}[\s\-]?\d{3,}/.test(t)) return false; // intl phone format
+
+  // Count alphabetic vs total characters — names should be >70% alpha
+  var alphaChars = (t.match(/[A-Za-zÀ-ſ]/g) || []).length; // Latin + extended
+  var totalChars = t.replace(/\s/g, '').length;
+  if (totalChars === 0) return false;
+  if (alphaChars / totalChars < 0.7) return false;
+
+  // Each word must have at least one alphabetic char
+  var words = t.split(/\s+/);
+  if (words.length > 5) return false;
+  for (var i = 0; i < words.length; i++) {
+    if (!/[A-Za-z]/.test(words[i])) return false;
+  }
+
+  // Reject obvious non-name junk (LinkedIn page artifacts)
+  var junkPatterns = /^(connections?|followers?|verified|premium|view|profile|page|see\s+more|loading|undefined|null)$/i;
+  if (junkPatterns.test(t)) return false;
+
+  return true;
 }
 
 /** Convert 1-indexed column number to A1 letter (25 -> Y, 26 -> Z, 27 -> AA). */

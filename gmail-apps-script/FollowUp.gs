@@ -281,33 +281,40 @@ function _buildSignalPool(dossier) {
 // ─── FALLBACK (when LLM unavailable or fails) ────────────
 
 function _fallbackFollowUp(lead, originalSubject, stage) {
-  var firstName = lead.firstName || (lead.fullName || '').split(' ')[0] || 'there';
-  var company = lead.organization || 'your company';
+  // FIX 4+5 (2026-06-13-followup-thread): subject is always '' — thread inherits.
+  // FIX 5: bodies are 50-90 words, plain text, reference prior email context,
+  //   add one value point (not "bumping"), low-commitment CTA.
+  //   Stage 3 = graceful break-up, no ask. Sign 'Gaurav' only.
+  //   Use lead.fullName / lead.organization as sheet-truth (never re-derive).
+  var firstName = (lead.firstName || (lead.fullName || '').split(' ')[0] || 'there').trim();
+  var company = (lead.organization || 'your company').trim();
 
-  var subject = '';
   var body = '';
 
   if (stage === 1) {
-    subject = 'One thought on ' + company;
+    // Stage 1: reference prior email, add concrete value point, soft ask
     body = 'Hi ' + firstName + ',\n\n' +
-           'Sent you a note last week — realized it might have landed at a bad moment.\n\n' +
-           'Been tracking how ' + company + ' is scaling and had one concrete thought I didn\'t fit into the first email. Happy to share in 3 lines if useful.\n\n' +
-           'Worth a reply?\n\nGaurav';
+           'Shared a note on how I\'ve been thinking about ' + company + '\'s growth levers — wanted to add one thing I left out.\n\n' +
+           'At Blinkit Bistro I tightened 13 ops variables across 121K orders and cut complaints 94% in under three weeks. There\'s a pattern in how the early signals surface that I think applies directly to your context.\n\n' +
+           'Worth a 10-minute call to compare notes?\n\n' +
+           'Gaurav';
   } else if (stage === 2) {
-    subject = 'Quick number, ' + firstName;
+    // Stage 2: cite verified metric, tie to their context, low-commitment ask
     body = 'Hi ' + firstName + ',\n\n' +
-           'Quick one. At Blinkit Bistro I cut complaint rate 94% across 121K orders by tightening 13 margin levers — closed a 40% quality gap in 2.5 weeks.\n\n' +
-           'If anything adjacent is on your plate at ' + company + ', I\'d be happy to walk through what moved the needle. 15 min?\n\nGaurav';
+           'One concrete number that might be relevant to ' + company + ': reduced a 40% ops quality gap to near-zero in 2.5 weeks by isolating the three levers that actually moved the metric, not the twelve that looked like they should.\n\n' +
+           'If anything on the ops or growth side is creating drag for your team right now, I\'d like to understand what it looks like. 15 minutes?\n\n' +
+           'Gaurav';
   } else {
-    subject = 'Closing the loop';
+    // Stage 3: graceful break-up, no ask, acknowledge timing
     body = 'Hi ' + firstName + ',\n\n' +
-           'Last note — won\'t keep pinging. If the timing isn\'t right, no worries.\n\n' +
-           'If ' + company + ' ever needs a set of eyes on ops, growth, or AI workflows, my door\'s open. Rooting for what you\'re building.\n\nGaurav';
+           'Last note from me — I know the inbox gets loud and timing isn\'t always right.\n\n' +
+           'If ' + company + ' ever hits a moment where an outside perspective on ops, growth, or AI systems would be useful, I\'d be glad to reconnect. Genuinely rooting for what you\'re building.\n\n' +
+           'Gaurav';
   }
 
   return {
     stage: stage,
-    subject: subject,
+    subject: '',  // FIX 4: always blank — thread inherits subject
     body: body,
     framework: _getFrameworkForStage(stage).name,
     signalUsed: 'fallback',
@@ -326,6 +333,14 @@ function _fallbackFollowUp(lead, originalSubject, stage) {
  */
 function processScheduledFollowUps() {
   Logger.log('[FollowUp] processScheduledFollowUps started at ' + new Date().toISOString());
+
+  // Acquire a script-level lock to prevent concurrent runs from racing to create
+  // the same follow-up draft (e.g., two trigger firings within the same minute).
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    Logger.log('[FollowUp] processScheduledFollowUps: could not acquire lock, skipping run');
+    return;
+  }
 
   try {
     var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
@@ -352,14 +367,76 @@ function processScheduledFollowUps() {
       leadName:       headers.indexOf('LeadName'),
       stage:          headers.indexOf('Stage'),
       offsetDays:     headers.indexOf('OffsetDays'),
-      parentRow:      headers.indexOf('ParentRow')
+      parentRow:      headers.indexOf('ParentRow'),
+      notes:          headers.indexOf('Notes')
     };
 
     // Back-compat: if OffsetDays / ParentRow aren't there (old sheets),
     // fall back to the legacy behaviour of firing by ScheduledDate alone.
     var hasOffsetSchema = col.offsetDays >= 0 && col.parentRow >= 0;
     var now = new Date();
-    var drafted = 0, skipped = 0, errored = 0;
+    var drafted = 0, skipped = 0, errored = 0, deferred = 0;
+
+    // FIX 3b (2026-06-13-followup-thread): Build per-email structures BEFORE the loop.
+    // (i)  For each parentEmail: only fire the LOWEST-stage due PENDING row per run.
+    // (ii) For (email,stage) groups with multiple PENDING rows: keep earliest, mark rest CANCELLED.
+    //
+    // Pass 1: Collect all due PENDING rows, mark superseded duplicates.
+    var dueRows = [];       // { rowIdx, email, stage, scheduledDateMs }
+    var pendingGroups = {}; // email|stage -> [{ rowIdx, scheduledDateMs }]
+
+    for (var scanI = 1; scanI < data.length; scanI++) {
+      var scanRow = data[scanI];
+      var scanStatus = ((scanRow[col.status] || '') + '').trim();
+      if (scanStatus !== 'PENDING') continue;
+      var scanEmail = (scanRow[col.email] || '').toString().trim().toLowerCase();
+      var scanStage = (scanRow[col.stage] || '').toString().trim();
+      if (!scanEmail || !scanStage) continue;
+
+      // Compute fire date for sorting
+      var scanFireMs = 0;
+      if (col.scheduledDate >= 0 && scanRow[col.scheduledDate]) {
+        scanFireMs = new Date(scanRow[col.scheduledDate]).getTime() || 0;
+      }
+
+      var groupKey = scanEmail + '|' + scanStage;
+      if (!pendingGroups[groupKey]) pendingGroups[groupKey] = [];
+      pendingGroups[groupKey].push({ rowIdx: scanI, scheduledDateMs: scanFireMs });
+    }
+
+    // Mark superseded duplicate PENDING rows (same email+stage, keep earliest-scheduled)
+    var cancelledDuplicates = 0;
+    Object.keys(pendingGroups).forEach(function(key) {
+      var group = pendingGroups[key];
+      if (group.length < 2) return;
+      // Sort ascending by scheduled date (or row index as tiebreak)
+      group.sort(function(a, b) {
+        return a.scheduledDateMs !== b.scheduledDateMs
+          ? a.scheduledDateMs - b.scheduledDateMs
+          : a.rowIdx - b.rowIdx;
+      });
+      // Keep [0], cancel [1..n]
+      for (var gi = 1; gi < group.length; gi++) {
+        var cancelRowIdx = group[gi].rowIdx;
+        try {
+          followupsSheet.getRange(cancelRowIdx + 1, col.status + 1).setValue('CANCELLED');
+          var notesColIdx = col.notes >= 0 ? col.notes : -1;
+          if (notesColIdx >= 0) {
+            followupsSheet.getRange(cancelRowIdx + 1, notesColIdx + 1).setValue('[DUP_FOLLOWUP] superseded');
+          }
+          data[cancelRowIdx][col.status] = 'CANCELLED'; // update in-memory
+          cancelledDuplicates++;
+        } catch (cancelErr) {
+          Logger.log('[FollowUp] Could not cancel duplicate row ' + (cancelRowIdx + 1) + ': ' + cancelErr.message);
+        }
+      }
+    });
+    if (cancelledDuplicates > 0) {
+      Logger.log('[FollowUp] Cancelled ' + cancelledDuplicates + ' duplicate PENDING rows');
+    }
+
+    // One-per-lead gate: track which parentEmails have already fired this run
+    var firedThisRun = {};
 
     for (var i = 1; i < data.length; i++) {
       var row = data[i];
@@ -367,11 +444,17 @@ function processScheduledFollowUps() {
       if (status === 'SENT' || status === 'CANCELLED') continue;
 
       var leadEmail = (row[col.email] || '').toString().trim();
-      var subject   = (row[col.subject] || '').toString();
       var body      = (row[col.body] || '').toString();
       var stage     = parseInt(row[col.stage]) || 1;
 
       if (!leadEmail || !body) { skipped++; continue; }
+
+      // FIX 3b (i): one-per-run per lead — skip if a higher-priority (lower-stage) row
+      // for this email already fired this run
+      if (firedThisRun[leadEmail.toLowerCase()]) {
+        skipped++;
+        continue;
+      }
 
       // Look up parent lead — new path via ParentRow, legacy path via email scan
       var parentLead = null;
@@ -398,7 +481,11 @@ function processScheduledFollowUps() {
       }
 
       // ── If the recipient already replied, cancel the follow-up ──
-      if (parentLead.status === STATUS.RESPONDED) {
+      // CRITICAL AUDIT FIX 2026-05-12: ReplyDetector writes 'REPLIED' to STATUS
+      // but FollowUp.gs was only checking STATUS.RESPONDED. This mismatch let
+      // follow-ups fire AGAINST leads who had already replied — sender-reputation
+      // damaging. Now check both forms (legacy STATUS.RESPONDED + new 'REPLIED').
+      if (parentLead.status === STATUS.RESPONDED || parentLead.status === 'REPLIED') {
         followupsSheet.getRange(i + 1, col.status + 1).setValue('CANCELLED');
         skipped++;
         continue;
@@ -419,27 +506,107 @@ function processScheduledFollowUps() {
 
       if (fireDate > now) continue;  // not yet due
 
+      // ── Final STATUS re-check (race guard) ──────────────────────────────────
+      // A concurrent ReplyDetector run may have written REPLIED / BOUNCED between
+      // when we loaded `data` above and now. Re-read from the sheet before drafting.
+      // PATCH 2026-06-13-final-cert: added RESPONDED (= STATUS.RESPONDED, the canonical
+      // string written by ReplyDetector.gs:147). The batch-load check at line 488
+      // already checked STATUS.RESPONDED; the race guard missed it, leaving a window
+      // where a reply arriving between batch-load and createFollowUpDraft was not
+      // caught — follow-up would fire against an already-replied lead.
+      var freshStatus = _readSheet2Status(ss, hasOffsetSchema ? parseInt(row[col.parentRow]) : -1, leadEmail);
+      if (freshStatus === 'REPLIED' || freshStatus === 'RESPONDED' ||
+          freshStatus === STATUS.RESPONDED ||
+          freshStatus === 'BOUNCED' ||
+          freshStatus === 'BOUNCED_HARD' || freshStatus === 'CANCELLED_REPLIED') {
+        Logger.log('[FollowUp] Follow-up cancelled at send-time (status=' + freshStatus +
+                   ') for row ' + (i + 1));
+        followupsSheet.getRange(i + 1, col.status + 1).setValue('CANCELLED_REPLIED');
+        skipped++;
+        continue;
+      }
+
       // ── Create threaded follow-up via unified rate-limited path ──
+      // FIX 4 (2026-06-13-followup-thread): Do NOT pass subject — thread inherits it.
       try {
         var result = createFollowUpDraft(
           parentLead,
           stage,
-          subject || parentLead.subjectLine || '',
+          '',
           body,
           parentLead.threadId
         );
 
         if (result.success) {
+          // FIX 3b (iii): IMMEDIATELY mark SENT after success — prevents concurrent re-fire
           followupsSheet.getRange(i + 1, col.status + 1).setValue('SENT');
           if (col.scheduledDate >= 0) {
             followupsSheet.getRange(i + 1, col.scheduledDate + 1).setValue(fireDate);
           }
+          // Write draftId to notes for traceability
+          if (col.notes >= 0 && result.draftId) {
+            followupsSheet.getRange(i + 1, col.notes + 1).setValue('draftId=' + result.draftId);
+          }
+
+          // Mark as fired for this run (one-per-run gate)
+          firedThisRun[leadEmail.toLowerCase()] = true;
 
           // Update parent lead's follow-up stage status in DATA_SHEET
+          // PATCH Phase 8 (F-33 fix): URL-keyed write to defend against Sheet2
+          // UNIQUE() row-shuffle while this follow-up cron is running.
           var nextStatus = STATUS['FOLLOWUP_' + stage] || parentLead.status;
-          updateLeadFields(parentLead.rowNum, { STATUS: nextStatus, FOLLOWUP_STAGE: stage });
+          var _fuOpts = parentLead.linkedinUrl ? { verifyUrl: parentLead.linkedinUrl } : undefined;
+          updateLeadFields(parentLead.rowNum, { STATUS: nextStatus, FOLLOWUP_STAGE: stage }, _fuOpts);
+
+          // FCM push notification
+          if (typeof sendFcmBroadcast === 'function') {
+            try {
+              sendFcmBroadcast(
+                'Follow-up draft ready',
+                'Stage-' + stage + ' draft for ' + (parentLead.fullName || ''),
+                {
+                  event: 'followup_draft_created',
+                  stage: String(stage),
+                  leadRow: String(parentLead.rowNum),
+                  draftId: String(result.draftId || '')
+                }
+              );
+            } catch (fcmErr) {
+              Logger.log('[FollowUp] FCM push error (non-fatal): ' + fcmErr.message);
+            }
+          }
 
           drafted++;
+
+        } else if (result.deferred) {
+          // FIX 3b (iv): Deferred (no thread found) — leave PENDING, increment retry counter.
+          // Max 5 retries then CANCELLED.
+          var notesCell = col.notes >= 0
+            ? (followupsSheet.getRange(i + 1, col.notes + 1).getValue() || '').toString()
+            : '';
+          var retryMatch = notesCell.match(/deferred_retries:(\d+)/);
+          var retryCount = retryMatch ? parseInt(retryMatch[1]) : 0;
+          retryCount++;
+
+          Logger.log('[FollowUp] deferred row ' + (i + 1) + ' email=' + leadEmail + ' retries=' + retryCount);
+
+          if (retryCount >= 5) {
+            followupsSheet.getRange(i + 1, col.status + 1).setValue('CANCELLED');
+            if (col.notes >= 0) {
+              followupsSheet.getRange(i + 1, col.notes + 1).setValue('[FOLLOWUP_UNDELIVERABLE no thread]');
+            }
+            Logger.log('[FollowUp] CANCELLED row ' + (i + 1) + ' after 5 deferred retries');
+          } else {
+            // Leave PENDING, update retry counter in notes
+            if (col.notes >= 0) {
+              var newNotes = notesCell.replace(/deferred_retries:\d+/, '').trim();
+              newNotes = (newNotes ? newNotes + ' ' : '') + 'deferred_retries:' + retryCount;
+              followupsSheet.getRange(i + 1, col.notes + 1).setValue(newNotes.trim());
+            }
+          }
+          deferred++;
+          // Do NOT count deferred against one-per-run for this lead
+
         } else {
           Logger.log('[FollowUp] createFollowUpDraft failed for row ' + (i + 1) + ': ' + result.error);
           errored++;
@@ -450,13 +617,49 @@ function processScheduledFollowUps() {
       }
     }
 
-    Logger.log('[FollowUp] Done. Drafted=' + drafted + ', skipped=' + skipped + ', errored=' + errored);
+    Logger.log('[FollowUp] Done. Drafted=' + drafted + ', skipped=' + skipped +
+               ', errored=' + errored + ', deferred=' + deferred);
   } catch (e) {
     Logger.log('[FollowUp] Fatal in processScheduledFollowUps: ' + e.toString());
+  } finally {
+    lock.releaseLock();
   }
 }
 
 // ─── HELPERS ─────────────────────────────────────────────
+
+/**
+ * Reads the STATUS column for a lead from Sheet2 immediately before creating
+ * a follow-up draft, to guard against a race where ReplyDetector wrote REPLIED
+ * between batch-load and draft-create.
+ *
+ * @param {Spreadsheet} ss        Open spreadsheet object
+ * @param {number}      parentRow 1-indexed row in Sheet2, or -1 if unknown
+ * @param {string}      leadEmail fallback: scan by email when parentRow is -1
+ * @returns {string} STATUS value, or '' if not found
+ */
+function _readSheet2Status(ss, parentRow, leadEmail) {
+  try {
+    var sheet2 = ss.getSheetByName(CONFIG.DATA_SHEET);
+    if (!sheet2) return '';
+    var c = CONFIG.COLUMNS;
+    if (parentRow && parentRow > 1 && parentRow <= sheet2.getLastRow()) {
+      return (sheet2.getRange(parentRow, c.STATUS).getValue() || '').toString().trim();
+    }
+    // Fallback: scan by email
+    if (leadEmail && sheet2.getLastRow() >= 2) {
+      var emails = sheet2.getRange(2, c.EMAIL, sheet2.getLastRow() - 1, 1).getValues();
+      for (var i = 0; i < emails.length; i++) {
+        if ((emails[i][0] || '').toString().trim().toLowerCase() === leadEmail.toLowerCase()) {
+          return (sheet2.getRange(i + 2, c.STATUS).getValue() || '').toString().trim();
+        }
+      }
+    }
+  } catch (e) {
+    Logger.log('[FollowUp] _readSheet2Status error: ' + e.message);
+  }
+  return '';
+}
 
 function _getFrameworkForStage(stage) {
   if (stage === 1) return FOLLOWUP_FRAMEWORKS.VALUE_ADD;

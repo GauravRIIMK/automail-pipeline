@@ -7,6 +7,25 @@
  * ============================================================
  */
 
+// ─── ARCHETYPE DETECTION REGEXES (PATCH 2026-05-13) ──────────
+// HR_TITLE_REGEX catches Recruiter / TA / People-Ops roles by title/headline.
+// CXO_TITLE_REGEX — TIGHTENED 2026-05-13: only matches TRUE super-senior titles.
+//
+// Why so conservative:
+//   - Titles can be misleading. "Head of Growth" at a 30-person startup is
+//     Senior-Director-equivalent, not C-Suite. They benefit from the STANDARD
+//     pitch with the 3 AI projects bullet block, not the brief CXO_SHORT shape.
+//   - "VP <function>" is functional leadership, not board-adjacent. STANDARD
+//     applies. Same logic for CTO/CMO of <100-person companies.
+//   - Solo / bootstrap founders need full credentials + AI projects to build
+//     trust; they're not "too senior to read a long email."
+//
+// Removed from CXO route: 'cto', 'cmo', 'vp ', 'svp ', 'evp ', 'head of',
+// 'founder', 'co-founder', 'cofounder', and bare 'chief' (substring of many
+// titles). The remaining regex catches only board-and-above titles.
+var HR_TITLE_REGEX = /\b(recruiter|recruiting|talent acquisition|talent partner|people ops|people operations|people & culture|hr manager|hr lead|hrbp|hr business partner|ta lead|ta manager|staffing|head of people|head of talent)\b/i;
+var CXO_TITLE_REGEX = /\b(ceo|cfo|coo|chief\s+\w+(?:\s+\w+)?\s+officer|chairman|chairperson|chairwoman|president|managing\s+director|managing\s+partner)\b/i;
+
 // ─── COMPANY STAGE ROUTING ─────────────────────────────────
 // Maps company stage to template/approach preferences
 // REFRAMED: Tone adjustments emphasize team expansion, growth needs, hiring signals
@@ -197,8 +216,50 @@ function classifyLead(lead, dossier) {
 function _detectEdgeCases(lead, dossier) {
   var detected = [];
 
-  // 1. HR_RECRUITER
-  if (lead.isHR) {
+  // 0. CXO_SHORT — checked BEFORE HR so a VP of HR is routed as CXO first.
+  //
+  // PATCH 2026-05-13: tightened gating so STANDARD becomes the default. We now
+  // require BOTH a true C-Suite title (per the tightened CXO_TITLE_REGEX above)
+  // AND a "mature" company context. Title alone is insufficient — a CEO of a
+  // 10-person startup still benefits from STANDARD's full pitch.
+  //
+  // "Mature" company = any of:
+  //   - dossier.co.stage in {SERIES_C_PLUS, PROFITABLE, PUBLIC}
+  //   - dossier.co.size >= 500 employees
+  //   - lead.seniority === 'C_SUITE' (explicit upstream signal)
+  //
+  // Everything else (including VP, Director, Head Of, small-company founder)
+  // falls through to STANDARD with the canonical 3 AI projects bullet block.
+  //
+  // PATCH 2026-05-18 (improvement #3): also accept VP_DIRECTOR with
+  // explicit "high" dossier.decisionPower as a third path into CXO_SHORT.
+  // Catches the "Head Of <X> at large enterprise who's actually a decision-
+  // maker" case that title-regex alone misses. Conservative — junior /
+  // manager seniority levels do NOT qualify even with high decision power
+  // (decision-power claims at lower seniority are usually Gemini overstating).
+  var isCxoTitle = CXO_TITLE_REGEX.test(lead.designation || '')
+      || CXO_TITLE_REGEX.test(lead.headline || '');
+  var hasCSuiteSeniority = (lead.seniority === 'C_SUITE');
+  var stageMature = false;
+  if (dossier && dossier.co && dossier.co.stage) {
+    var coStage = (dossier.co.stage || '').toString().toUpperCase();
+    stageMature = (coStage === 'SERIES_C_PLUS' || coStage === 'PROFITABLE' || coStage === 'PUBLIC');
+  }
+  var companyLarge = !!(dossier && dossier.co && dossier.co.size && dossier.co.size >= 500);
+  var hasHighDecisionPower = !!(dossier && dossier.decisionPower
+      && /^(very[\s-]?high|high)\b/i.test(dossier.decisionPower.toString().trim()));
+  var isExecutiveSeniority = (lead.seniority === 'C_SUITE' || lead.seniority === 'VP_DIRECTOR');
+  var isCxo = hasCSuiteSeniority
+      || (isCxoTitle && (stageMature || companyLarge))
+      || (hasHighDecisionPower && isExecutiveSeniority);
+  if (isCxo) {
+    detected.push('CXO_SHORT');
+  }
+
+  // 1. HR_RECRUITER — flag-based OR title/headline regex (PATCH 2026-05-12)
+  var isHrByFlag  = !!lead.isHR;
+  var isHrByTitle = HR_TITLE_REGEX.test(lead.designation || '') || HR_TITLE_REGEX.test(lead.headline || '');
+  if (isHrByFlag || isHrByTitle) {
     detected.push('HR_RECRUITER');
   }
 
@@ -266,6 +327,44 @@ function _detectEdgeCases(lead, dossier) {
     detected.push('FOUNDER_LEAD');
   }
 
+  // ── PATCH 2026-05-18: dossier-derived signals (improvement #3) ──
+  //
+  // ResearchEngine populates dossier.decisionPower and dossier.communicationStyle
+  // for every lead, but they were never read by the classifier — wasted
+  // intelligence. These two signals carry information that title-regex
+  // alone misses, especially for:
+  //   • "Director / Head Of / Senior IC" roles where the title ambiguously
+  //     spans low- to high-authority depending on company structure
+  //   • Recipients whose LinkedIn style flags a tone preference (data-first
+  //     vs narrative-first) that should drive the opening sentence
+  //
+  // 12. HIGH_DECISION_POWER — research dossier explicitly classifies this
+  //     person as a decision-maker. Acts as a tone modulator + (when
+  //     combined with VP_DIRECTOR seniority) as a soft CXO_SHORT eligibility
+  //     signal. Conservative: requires explicit "high" string, ignores
+  //     fuzzy or "medium-high" because Gemini emits those generously.
+  if (dossier && dossier.decisionPower
+      && /^(very[\s-]?high|high)\b/i.test(dossier.decisionPower.toString().trim())) {
+    detected.push('HIGH_DECISION_POWER');
+  }
+
+  // 13. DATA_DRIVEN_STYLE — recipient's communication style is metric-led /
+  //     analytical. Composer should lead with a number in the hook.
+  if (dossier && dossier.communicationStyle
+      && /\b(data[\s-]?driven|analytical|quantitative|metric|results[\s-]?oriented|numbers[\s-]?first)\b/i
+          .test(dossier.communicationStyle.toString())) {
+    detected.push('DATA_DRIVEN_STYLE');
+  }
+
+  // 14. NARRATIVE_STYLE — recipient prefers story / context / vision framing
+  //     over hard numbers. Composer should soften the metric-density and
+  //     lean on the "thread across all three" synthesis.
+  if (dossier && dossier.communicationStyle
+      && /\b(narrative|story|vision|thoughtful|reflective|conceptual|big[\s-]?picture)\b/i
+          .test(dossier.communicationStyle.toString())) {
+    detected.push('NARRATIVE_STYLE');
+  }
+
   return detected;
 }
 
@@ -288,6 +387,29 @@ function _getCompanyStageRoute(dossier) {
 // ─── TEMPLATE SELECTION ────────────────────────────────────
 
 /**
+ * _t4TriggerQualifies(edgeCases, triggers) — PURE helper (no side-effects).
+ * PATCH 2026-06-12-autonomous-close: determines whether a trigger set justifies
+ * the T4_TRIGGER_EVENT template under strict mode.
+ *
+ * Returns true if:
+ *   (a) edgeCases contains 'RECENTLY_FUNDED', OR
+ *   (b) the first trigger's event/type matches a qualifying funding/expansion keyword.
+ *
+ * Generic triggers ('new office plant', 'team outing', etc.) return false, letting
+ * T1/T2/T3/T5 win their natural cases instead of always forcing T4.
+ *
+ * @param {Array} edgeCases
+ * @param {Array} triggers — each has .event and/or .type
+ * @returns {boolean}
+ */
+function _t4TriggerQualifies(edgeCases, triggers) {
+  if (edgeCases && edgeCases.indexOf('RECENTLY_FUNDED') >= 0) return true;
+  if (!triggers || !triggers.length) return false;
+  var firstEvent = String((triggers[0].event || triggers[0].type || '')).toLowerCase();
+  return /fund|rais|series\s+[a-z]\b|ipo|acquisi|launch|expan|partner/i.test(firstEvent);
+}
+
+/**
  * Priority-based template selection.
  * CRITICAL: T4 trigger events handled in single if/else if block
  * to prevent duplicate T4 selection.
@@ -301,7 +423,11 @@ function _getCompanyStageRoute(dossier) {
 function _selectTemplate(lead, dossier, edgeCases, stageRoute) {
   var candidates = [];
 
-  // Priority 1: Specific edge case overrides
+  // Priority 1: Specific edge case overrides (CXO before HR — VP of HR is CXO first)
+  if (edgeCases.indexOf('CXO_SHORT') >= 0) {
+    return 'CXO_SHORT';
+  }
+
   if (edgeCases.indexOf('HR_RECRUITER') >= 0) {
     return 'HR_PARTNERSHIP';
   }
@@ -321,11 +447,19 @@ function _selectTemplate(lead, dossier, edgeCases, stageRoute) {
   }
 
   // Priority 3: Trigger events — CRITICAL FIX: Single if/else if block
+  // PATCH 2026-06-12-autonomous-close: TEMPLATE_TRIGGER_STRICT gate (default STRICT=true).
+  // When strict, only push T4 if RECENTLY_FUNDED edgeCase is present OR the first
+  // trigger's event/type matches a qualifying funding/expansion keyword. Generic triggers
+  // (e.g. 'new office plant') no longer force T4 when strict, letting T1/T2/T3/T5 win.
+  // Rollback: set CONFIG.TEMPLATE_TRIGGER_STRICT = false (no code push needed).
+  var _trigStrict = !(CONFIG && CONFIG.TEMPLATE_TRIGGER_STRICT === false);
   if (dossier && dossier.triggers && dossier.triggers.length > 0) {
-    var triggerReasoning = edgeCases.indexOf('RECENTLY_FUNDED') >= 0
-      ? 'Recent funding event detected'
-      : 'Trigger event: ' + (dossier.triggers[0].event || dossier.triggers[0].type || '');
-    candidates.push({ template: 'T4_TRIGGER_EVENT', priority: 3, reasoning: triggerReasoning });
+    if (!_trigStrict || _t4TriggerQualifies(edgeCases, dossier.triggers)) {
+      var triggerReasoning = edgeCases.indexOf('RECENTLY_FUNDED') >= 0
+        ? 'Recent funding event detected'
+        : 'Trigger event: ' + (dossier.triggers[0].event || dossier.triggers[0].type || '');
+      candidates.push({ template: 'T4_TRIGGER_EVENT', priority: 3, reasoning: triggerReasoning });
+    }
   } else if (edgeCases.indexOf('RECENTLY_FUNDED') >= 0) {
     candidates.push({ template: 'T4_TRIGGER_EVENT', priority: 3, reasoning: 'Recent funding event detected' });
   }
@@ -406,6 +540,9 @@ function _determineArchetype(lead, dossier, classification) {
   if (template === 'HR_PARTNERSHIP') {
     return 'HR_RECRUITER';
   }
+  if (template === 'CXO_SHORT') {
+    return 'CXO_SHORT';
+  }
 
   // Fallback by seniority
   if (seniority === 'C_SUITE') {
@@ -445,6 +582,13 @@ function _applyEdgeCaseAdjustments(result, lead, dossier) {
     result.expectedResponse = 'very-low';
   }
 
+  // CXO_SHORT: ultra-brief, high-signal
+  if (edgeCases.indexOf('CXO_SHORT') >= 0) {
+    result.emailWordLimit = 120;
+    result.toneAdjustment = 'executive brief, high-signal, 100-120 words max';
+    result.expectedResponse = 'medium';
+  }
+
   // HR_RECRUITER: professional, opportunity-focused
   if (edgeCases.indexOf('HR_RECRUITER') >= 0) {
     result.toneAdjustment = 'professional, role-focused, mention specific skills match';
@@ -472,6 +616,45 @@ function _applyEdgeCaseAdjustments(result, lead, dossier) {
   // DOMAIN_MISMATCH: flag for review
   if (edgeCases.indexOf('DOMAIN_MISMATCH') >= 0) {
     result.riskFlag = 'DOMAIN_MISMATCH: lead may have changed jobs recently';
+  }
+
+  // ── PATCH 2026-05-18 (improvement #3): expose research signals to ──
+  // EmailComposer so the composer can modulate prompt tone. Stored on
+  // result.researchSignals (consumed by _buildCompositionContext +
+  // _buildSystemPrompt). Conservative defaults so absence is a no-op.
+  result.researchSignals = {
+    highDecisionPower: edgeCases.indexOf('HIGH_DECISION_POWER') >= 0,
+    dataDrivenStyle:   edgeCases.indexOf('DATA_DRIVEN_STYLE') >= 0,
+    narrativeStyle:    edgeCases.indexOf('NARRATIVE_STYLE') >= 0,
+    rawDecisionPower:  (dossier && dossier.decisionPower) ? dossier.decisionPower.toString() : '',
+    rawCommStyle:      (dossier && dossier.communicationStyle) ? dossier.communicationStyle.toString() : ''
+  };
+
+  // High decision power adds a tone overlay even when the shape didn't
+  // change. "Don't bury the lede" → composer should lead with one
+  // concrete signal in sentence 1, skip throat-clearing context.
+  if (edgeCases.indexOf('HIGH_DECISION_POWER') >= 0
+      && edgeCases.indexOf('CXO_SHORT') < 0) {
+    var existingTone = result.toneAdjustment || '';
+    result.toneAdjustment = (existingTone ? existingTone + '. ' : '')
+      + 'Recipient is a decision-maker — open with the strongest concrete '
+      + 'signal in sentence 1, skip warm-up framing.';
+  }
+
+  // Data-driven style: tighten the first 2 sentences around a metric
+  if (edgeCases.indexOf('DATA_DRIVEN_STYLE') >= 0) {
+    var existingTone2 = result.toneAdjustment || '';
+    result.toneAdjustment = (existingTone2 ? existingTone2 + '. ' : '')
+      + 'Recipient is data-driven — hook MUST include one specific number '
+      + '(revenue, growth %, headcount, or year) in the first or second sentence.';
+  }
+
+  // Narrative style: emphasize the synthesis line, soften metric density
+  if (edgeCases.indexOf('NARRATIVE_STYLE') >= 0) {
+    var existingTone3 = result.toneAdjustment || '';
+    result.toneAdjustment = (existingTone3 ? existingTone3 + '. ' : '')
+      + 'Recipient prefers narrative framing — lead bullets with the '
+      + 'category-label theme (the "why") before the metric (the "what").';
   }
 
   return result;
@@ -592,6 +775,9 @@ function _buildApproachString(lead, template, edgeCases) {
       break;
     case 'HR_PARTNERSHIP':
       parts.push('Role opportunity discussion with hiring team');
+      break;
+    case 'CXO_SHORT':
+      parts.push('Executive brief, high-signal, 100-120 words max');
       break;
     default:
       parts.push('Standard informational approach');
