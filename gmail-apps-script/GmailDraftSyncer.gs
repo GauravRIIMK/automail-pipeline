@@ -54,12 +54,17 @@ var GMAIL_SYNC_MAX_PER_RUN = 50;   // bounded for 6-min Apps Script budget
 // creation path (BatchProcessor) gets the lion's share of the pool (~80%+).
 //
 // Override via ScriptProperty SYNCER_DAILY_GMAIL_OP_BUDGET / REPLY_DAILY_GMAIL_OP_BUDGET
-// (integer string) without a code push. These values are conservative by design:
-//   syncer: 3000 = 15% of pool; at 96 ticks/day this is 31 ops/tick average ceiling.
-//   reply:  1500 = 7.5% of pool; at 48 ticks/day this is 31 ops/tick average ceiling.
-//   combined ceiling: 22.5% → draft-creation gets ≥77.5% of the pool.
-var SYNCER_DAILY_GMAIL_OP_BUDGET = 3000;
-var REPLY_DAILY_GMAIL_OP_BUDGET  = 1500;
+// (integer string) without a code push.
+// ★RECALIBRATED -p6-gmail-reserve (2026-06-30): the prior 3000/1500 were sized as
+// "15%/7.5% of a ~20,000/day pool" — but that 20K pool figure was a MYTH. Live data
+// showed createDraft fail with "Service invoked too many times for one day: gmail"
+// at only ~3,812 metered scan ops (syncer 2297 + reply 1515). So the real GAS Gmail
+// ceiling for this account is ~5× smaller (~3.8-4K), and the old COMBINED budget
+// (4500) EXCEEDED it — letting the two scanners collectively starve draft creation.
+// New combined per-tag budget = 2000, held under the GMAIL_SCAN_TOTAL_BUDGET global
+// reserve (2200, below) so the rest of the real ceiling is left for createDraft.
+var SYNCER_DAILY_GMAIL_OP_BUDGET = 1200;
+var REPLY_DAILY_GMAIL_OP_BUDGET  = 800;
 
 // Per-tick row-scan cap + rotation cursor (2026-06-13-op-budget).
 // Cap rows checked per tick and rotate via a ScriptProperty cursor so each
@@ -90,6 +95,36 @@ function _gmOpBudgetRemaining(tag, budget) {
   }
 }
 
+// ── GLOBAL SCAN-RESERVE (-p6-gmail-reserve) ────────────────────────────────
+// The per-tag budgets above cap each scanner INDEPENDENTLY, but nothing bounds
+// their SUM — live data: syncer(2297)+reply(1515)=3812, each under its own budget
+// yet COLLECTIVELY hitting the real ceiling and starving createDraft. This global
+// cap makes BOTH scanners yield once today's TOTAL metered Gmail ops reach
+// GMAIL_SCAN_TOTAL_BUDGET, reserving the rest of the (observed ~3.8-4K, NOT the
+// mythical 20K) daily ceiling for draft creation. Kill-switch: GMAIL_SCAN_RESERVE_ENABLED='0'.
+var GMAIL_SCAN_TOTAL_BUDGET_DEFAULT = 2200;  // scans yield above this; remainder reserved for drafts
+
+// Pure (unit-testable): with today's total metered ops + the cap, must scans yield?
+function _gmScanReserveExceeded_(totalOps, cap) {
+  return (typeof totalOps === 'number' && typeof cap === 'number' && cap > 0 && totalOps >= cap);
+}
+
+// Reads the PT-date TOTAL meter + kill-switch. true = background scans must yield
+// to protect draft creation. Fail-open (false) if anything throws — never block
+// scans on a meter read error.
+function _gmScanReserveShouldYield() {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    if (props.getProperty('GMAIL_SCAN_RESERVE_ENABLED') === '0') return false;  // kill-switch
+    var cap = parseInt(props.getProperty('GMAIL_SCAN_TOTAL_BUDGET') || '', 10);
+    if (!(cap > 0)) cap = GMAIL_SCAN_TOTAL_BUDGET_DEFAULT;
+    var total = parseInt(props.getProperty('GMAIL_OPS_' + _gmPtDate()) || '0', 10);
+    return _gmScanReserveExceeded_(total, cap);
+  } catch (_) {
+    return false;
+  }
+}
+
 /**
  * Pure helper: build a targeted Gmail sent-folder query from a list of
  * recipient emails. Returns a query string like:
@@ -111,6 +146,20 @@ function _gmOpBudgetRemaining(tag, budget) {
  * @param {number}   searchDays - Lookback window in days
  * @returns {string|null}       - Query string, or null if recipients empty
  */
+// PATCH 2026-06-18-draftsync-transient: a draft lookup throwing is NOT proof the
+// draft is gone. GmailApp.getDraft() throws on a genuine not-found AND on transient
+// infra errors (rate limit / "service invoked too many times" / timeout). Treating
+// every throw as "gone" mass-marked 269 leads DRAFT_DELETED whose drafts still
+// existed (verified live via getDraft). Only an EXPLICIT not-found means gone; any
+// other error must NOT conclude deletion (skip the row, retry next tick). Pure.
+function _draftLookupErrorMeansGone(errMsg) {
+  var em = (errMsg || '').toString().toLowerCase();
+  if (!em) return false;  // empty/unknown → do NOT conclude gone
+  return em.indexOf('no item with the given id') >= 0 ||
+         em.indexOf('do not have permission') >= 0 ||
+         em.indexOf('not found') >= 0;
+}
+
 function _buildTargetedSentQuery(recipients, searchDays) {
   if (!recipients || recipients.length === 0) return null;
   var toClause = recipients.map(function(e) { return 'to:' + e; }).join(' OR ');
@@ -168,6 +217,12 @@ function syncSentDrafts(options) {
   // creation (BatchProcessor) keeps the lion's share of the ~20K/day consumer
   // Gmail quota. The budget is intentionally conservative (3000 = 15% of pool).
   // Override: ScriptProperty SYNCER_DAILY_GMAIL_OP_BUDGET (integer string).
+  // GLOBAL scan-reserve first: yield if the two scanners' COMBINED metered ops
+  // have reached the reserve cap, so createDraft keeps its share of the real ceiling.
+  if (!options._skipBudgetGuard && typeof _gmScanReserveShouldYield === 'function' && _gmScanReserveShouldYield()) {
+    Logger.log('[Syncer] global Gmail scan-reserve reached — yielding to protect draft creation');
+    return _gmailSyncerEmpty(dryRun, 'gmail_scan_reserve_reached');
+  }
   if (!options._skipBudgetGuard) {
     var _syncerBudget = (function() {
       try {
@@ -409,8 +464,18 @@ function syncSentDrafts(options) {
         var draft = GmailApp.getDraft(draftId);
         draftExists = !!draft;
       } catch (lookupErr) {
-        // Not found = either sent or explicitly deleted by user.
-        draftExists = false;
+        // PATCH 2026-06-18-draftsync-transient: distinguish a genuine not-found
+        // from a transient Gmail error. A transient throw is NOT proof the draft
+        // is gone — concluding so mass-marked live drafts DRAFT_DELETED. Only an
+        // explicit not-found counts; otherwise SKIP this row (retry next tick).
+        if (_draftLookupErrorMeansGone(lookupErr && lookupErr.message)) {
+          draftExists = false;  // genuinely gone (sent or deleted)
+        } else {
+          Logger.log('[Syncer] getDraft transient/ambiguous for row ' + rowNum + ' draft ' +
+                     draftId + ' (' + ((lookupErr && lookupErr.message) || '?') +
+                     ') — skipping; will NOT false-mark DRAFT_DELETED.');
+          continue;  // do not risk a false deletion on a transient error
+        }
       }
 
       if (draftExists) {

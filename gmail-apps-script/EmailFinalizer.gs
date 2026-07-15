@@ -230,6 +230,132 @@ function _orgDomainGateRejects(org, email, vendorMeta) {
   return true;
 }
 
+// ── OPERATOR CANDIDATE EMAIL (2026-06-23) ────────────────────────────────────
+// A TENTATIVE operator-supplied address — used as the recipient but kept UNVERIFIED
+// and [VERIFY]-flagged (never a clean verified/blind-send draft, never parked). Distinct
+// from the durable EMAIL_LOCK below (which is user_verified, conf 0.95, no flag). For the
+// case where the operator has a likely-but-unconfirmed address (e.g. Vedang: no source has
+// his real mailbox; a guess bounced). Stored in ScriptProperty CANDIDATE_EMAILS = {"<row>":"<email>"}.
+function _candidateEmailGet_(rowNum) {
+  try {
+    var m = JSON.parse(PropertiesService.getScriptProperties().getProperty('CANDIDATE_EMAILS') || '{}');
+    return m[String(rowNum)] || '';
+  } catch (_) { return ''; }
+}
+function menuSetCandidateEmail(rowNum, email) {
+  var rn = parseInt(rowNum, 10);
+  if (!rn) return { status: 'error', error: 'rowNum required' };
+  var props = PropertiesService.getScriptProperties();
+  var m = {};
+  try { m = JSON.parse(props.getProperty('CANDIDATE_EMAILS') || '{}'); } catch (_) {}
+  var e = (email || '').toString().trim().toLowerCase();
+  if (!e || e === 'clear' || e === 'none') {
+    delete m[String(rn)];
+  } else {
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)) return { status: 'error', error: 'invalid email', received: e };
+    m[String(rn)] = e;
+  }
+  props.setProperty('CANDIDATE_EMAILS', JSON.stringify(m));
+  return { status: 'ok', rowNum: rn, candidate: m[String(rn)] || '(cleared)', note: 'Tentative email — drafts with [VERIFY], never blind-sent. Reprocess (menuResetLeadToNew) to apply.', map: m };
+}
+
+// ── DURABLE EMAIL LOCK (2026-06-19-email-lock-hardened) ──────────────────────
+// The lock must survive pipeline NOTES rewrites AND multi-cycle reprocessing. The Vedansh
+// regression proved a NOTES-only lock is fragile: a later notes-rewrite wiped the
+// [EMAIL_LOCKED] marker, so the finalizer re-derived the wrong address and drafted it.
+// We now persist locks in a ScriptProperty map { "<rowNum>": "<email>" } — durable, and
+// untouched by any sheet/notes write. Keyed by Sheet2 rowNum (stable per lead).
+function _emailLockGet_(rowNum) {
+  if (!rowNum) return '';
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty('EMAIL_LOCKS');
+    if (!raw) return '';
+    var e = (JSON.parse(raw) || {})[String(rowNum)] || '';
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e.toLowerCase() : '';
+  } catch (_) { return ''; }
+}
+function _emailLockSet_(rowNum, email) {
+  if (!rowNum || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) return false;
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var raw = props.getProperty('EMAIL_LOCKS');
+    var map = raw ? (JSON.parse(raw) || {}) : {};
+    map[String(rowNum)] = String(email).toLowerCase().trim();
+    var keys = Object.keys(map);
+    if (keys.length > 500) { delete map[keys[0]]; }   // defensive cap — manual locks are rare
+    props.setProperty('EMAIL_LOCKS', JSON.stringify(map));
+    return true;
+  } catch (_) { return false; }
+}
+function _emailLockClear_(rowNum) {
+  if (!rowNum) return false;
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var raw = props.getProperty('EMAIL_LOCKS');
+    if (!raw) return false;
+    var map = JSON.parse(raw) || {};
+    if (String(rowNum) in map) { delete map[String(rowNum)]; props.setProperty('EMAIL_LOCKS', JSON.stringify(map)); return true; }
+    return false;
+  } catch (_) { return false; }
+}
+
+// ── HUMAN-VERIFIED ORG OVERRIDE (2026-06-19-org-override) ────────────────────
+// Durable, human-confirmed CURRENT employer for a row (ScriptProperty ORG_OVERRIDES =
+// { "<rowNum>": "<org>" }). Applied in _processOneLead BEFORE email-finding + composition so
+// BOTH the email domain AND the letter target the verified company. The manual, authoritative
+// counterpart to the (now-disabled) headline reconcile — human truth, always honoured.
+function _orgOverrideGet_(rowNum) {
+  if (!rowNum) return '';
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty('ORG_OVERRIDES');
+    if (!raw) return '';
+    return String((JSON.parse(raw) || {})[String(rowNum)] || '').trim();
+  } catch (_) { return ''; }
+}
+function _orgOverrideSet_(rowNum, org) {
+  if (!rowNum || !org) return false;
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var raw = props.getProperty('ORG_OVERRIDES');
+    var map = raw ? (JSON.parse(raw) || {}) : {};
+    map[String(rowNum)] = String(org).trim().substring(0, 80);
+    var keys = Object.keys(map);
+    if (keys.length > 500) { delete map[keys[0]]; }
+    props.setProperty('ORG_OVERRIDES', JSON.stringify(map));
+    return true;
+  } catch (_) { return false; }
+}
+function _orgOverrideClear_(rowNum) {
+  if (!rowNum) return false;
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var raw = props.getProperty('ORG_OVERRIDES');
+    if (!raw) return false;
+    var map = JSON.parse(raw) || {};
+    if (String(rowNum) in map) { delete map[String(rowNum)]; props.setProperty('ORG_OVERRIDES', JSON.stringify(map)); return true; }
+    return false;
+  } catch (_) { return false; }
+}
+
+// USER-LOCKED EMAIL extraction (2026-06-19-email-lock). The DURABLE store is authoritative
+// (survives notes rewrites + reprocessing — the Vedansh fix); the legacy [EMAIL_LOCKED:<addr>]
+// NOTES marker remains a fallback for transition. Returns '' when no valid lock is present.
+function _extractLockedEmail_(lead) {
+  if (lead && lead.rowNum) {
+    var durable = _emailLockGet_(lead.rowNum);
+    if (durable) return durable;
+  }
+  var notes = String((lead && lead.notes) || '');
+  var m = notes.match(/\[EMAIL_LOCKED:\s*([^\]\s]+@[^\]\s]+\.[^\]\s]+)\s*\]/i);
+  if (m && m[1]) {
+    var addr = m[1].toLowerCase().trim();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr) && addr.indexOf('placeholder.invalid') < 0) {
+      return addr;
+    }
+  }
+  return '';
+}
+
 // ─── PUBLIC ENTRY POINT ────────────────────────────────────────────────────
 
 /**
@@ -270,6 +396,59 @@ function finalizeEmailSelection(lead, enrichment) {
       runnerUps:  [],
       reoonStatus: 'mailtester_probe_bypass',
       reasoning:  'mailtester_probe_domain_locked_bypass',
+      synthetic:  false
+    });
+  }
+
+  // ── DEMO SELF-PROFILE BYPASS (2026-06-24 @288) — mirror of enrichEmail's short-circuit ──
+  // enrichEmail returns the showcase email + sets lead.isDemoSelf, but THIS finalizer would
+  // otherwise run the org-domain gate on the deliberately-fake demo domain (3-layer-engine.com
+  // has zero token overlap with the owner's org) → reject it → fall through → blank the email.
+  // That is exactly the "demo gave a blank mail ID" bug. Short-circuit here too, like the
+  // mail-tester probe above. Scoped to the OWNER slug ONLY (no real lead matches), drafts-only,
+  // tier='verified' so NO [VERIFY] prefix (clean demo). To disable: blank _DEMO_SELF_SLUG.
+  if ((lead.isDemoSelf === true) ||
+      (typeof _isDemoSelfProfile_ === 'function' && _isDemoSelfProfile_(lead.linkedinUrl))) {
+    lead.isDemoSelf = true;
+    if (!lead.designation) lead.designation = 'Growth & GTM Ops';
+    var _demoEmail = (typeof _DEMO_SELF_EMAIL !== 'undefined' && _DEMO_SELF_EMAIL) ||
+                     (enrichment && enrichment.email) || lead.email || '';
+    Logger.log('[EmailFinalizer] DEMO_SELF bypass row ' + (lead.rowNum || '?') +
+               ' — returning showcase email ' + _demoEmail + ', skipping gate/tiers');
+    return _finalize(lead, {
+      email:      _demoEmail,
+      confidence: 0.99,
+      tier:       'verified',
+      source:     'demo_3layer_engine',
+      domain:     (_demoEmail.split('@')[1] || '3-layer-engine.com'),
+      candidates: [_demoEmail],
+      runnerUps:  [],
+      reoonStatus: 'demo_self_bypass',
+      reasoning:  'demo_self_profile_domain_scoped_bypass',
+      synthetic:  false
+    });
+  }
+
+  // ── USER-LOCKED EMAIL (2026-06-19-email-lock) — HIGHEST PRECEDENCE ───────
+  // If a human has confirmed the recipient (menuCorrectAndPromoteEmail writes
+  // [EMAIL_LOCKED:<addr>] into NOTES), trust it ABSOLUTELY and skip ALL derivation.
+  // Without this, the promote re-run re-derives the SAME wrong address and — with the
+  // VERIFY_EMAIL hold gate bypassed by [EMAIL_VERIFIED_BY_USER] — drafts to it. The lock
+  // is the only thing that makes "correct the email, then promote" actually stick.
+  var _lockedEmail = _extractLockedEmail_(lead);
+  if (_lockedEmail) {
+    Logger.log('[EmailFinalizer] USER_LOCKED_EMAIL row ' + (lead.rowNum || '?') +
+               ' addr=' + _lockedEmail + ' — trusting human-verified address, skipping derivation');
+    return _finalize(lead, {
+      email:      _lockedEmail,
+      confidence: 0.95,
+      tier:       'verified',
+      source:     'user_verified',
+      domain:     _lockedEmail.split('@')[1] || '',
+      candidates: [_lockedEmail],
+      runnerUps:  [],
+      reoonStatus: 'user_locked',
+      reasoning:  'user_locked_email_precedence (human-confirmed via menuCorrectAndPromoteEmail)',
       synthetic:  false
     });
   }
@@ -526,8 +705,40 @@ function finalizeEmailSelection(lead, enrichment) {
   // Tier 3: constructed - synthesize email from primitives
   var constructed = _constructFromPrimitives(lead);
   if (constructed.email) {
+    // ── #2 PRE-FINALIZE DELIVERABILITY PROBE (2026-06-24, CONSTRUCTED_PROBE_ENABLED opt-out '0') ──
+    // Probe the constructed guess with Reoon (cache + daily-breaker guarded). Returns
+    // 'not_probed' whenever the key/quota/breaker is unavailable — so the test harness
+    // and depleted-quota days behave EXACTLY as before (constructed 0.20). The verdict
+    // refines tier/confidence below and can rescue a correct acronym domain at the gate.
+    var _cProbe = _probeConstructedEmail_(constructed.email);
+    var _cStatus = (_cProbe && _cProbe.status) || 'not_probed';
+
+    var _gateRejected = _orgDomainGateRejects(lead.organization, constructed.email, null);
+    var _bypassedGate = false;
+    // ── #2b ORG_DOMAIN_GATE BYPASS ON REOON-SAFE (guarded) ──
+    // A 'safe' verdict means the SPECIFIC mailbox exists at this domain — stronger evidence
+    // than org↔domain token overlap — so we override the token gate to rescue a correct
+    // acronym/short domain (e.g. hoabl.in for "House of Abhinandan Lodha").
+    // GUARDS (adversarial-review @286 — prevent an S.Roy-class regression):
+    //   • NOT for apollo_people_match_direct emails — those are Apollo's own address that
+    //     ALREADY failed the gate at Tiers 0/1/2; re-rescuing a live-but-wrong-company
+    //     Apollo mailbox is exactly S.Roy (s.roy@getstan.app is real, but org=Unacademy).
+    //     Only a genuinely pattern-CONSTRUCTED guess may bypass.
+    //   • NOT when the org itself is flagged uncertain (lead.orgArbVerify) — then the
+    //     DOMAIN choice is the unreliable step, so a live mailbox is no reassurance.
+    //   • catch_all NEVER bypasses (it "accepts" every address — not mailbox proof).
+    var _isApolloDirect = !!(constructed.method && constructed.method.indexOf('apollo') >= 0);
+    if (_gateRejected && _cStatus === 'safe' && !_isApolloDirect && lead.orgArbVerify !== true) {
+      logPipelineEvent(lead.rowNum, 'ENRICH',
+        '[ORG_DOMAIN_GATE_BYPASS] Reoon verified ' + constructed.email +
+        ' as safe (mailbox exists) — overriding org-token gate for org "' +
+        (lead.organization || '') + '". Draft stays [VERIFY] + org_recipient_mismatch flagged.', 'WARN');
+      _gateRejected = false;
+      _bypassedGate = true;
+    }
+
     // ORG_DOMAIN_GATE (2026-06-12-org-domain-gate): reject if org↔domain have zero token overlap
-    if (_orgDomainGateRejects(lead.organization, constructed.email, null)) {
+    if (_gateRejected) {
       logPipelineEvent(lead.rowNum, 'ENRICH',
         '[ORG_DOMAIN_GATE] Tier-3 constructed candidate ' + constructed.email +
         ' rejected for org "' + (lead.organization || '') + '" — all candidates mismatched, setting NEEDS_EMAIL_REVIEW', 'WARN');
@@ -568,15 +779,41 @@ function finalizeEmailSelection(lead, enrichment) {
         sheetEmailFlaggedNoVendorAlternative: !!_sheetEmailFlagged
       };
     } else {
+      // ── #2 PROBE-AWARE TIER / CONFIDENCE for the constructed guess ──
+      //   safe         → specific mailbox confirmed deliverable → low_confidence (0.55);
+      //                  drops 'high_bounce_risk'. KEEPS [VERIFY] (deliverability ≠ identity).
+      //   role_account → deliverable but generic mailbox → low_confidence (0.45)
+      //   catch_all    → domain accepts everything → won't bounce but unconfirmable →
+      //                  best_of_available (0.30); KEEPS [VERIFY]
+      //   invalid/disabled/spamtrap/disposable/unknown/skipped/not_probed →
+      //                  UNCHANGED constructed (0.20) + [VERIFY] + high_bounce_risk.
+      //                  A confirmed-bad address still DRAFTS under the no-park default
+      //                  (2026-06-24 user decision); the reoon status rides the reasoning
+      //                  so the operator sees the bounce risk before sending.
+      var _cTier = 'constructed';
+      var _cConf = _FINALIZER_TIER_CONFIDENCE.constructed;
+      if (_cStatus === 'safe')              { _cTier = 'low_confidence';    _cConf = 0.55; }
+      else if (_cStatus === 'role_account') { _cTier = 'low_confidence';    _cConf = 0.45; }
+      else if (_cStatus === 'catch_all')    { _cTier = 'best_of_available'; _cConf = _FINALIZER_TIER_CONFIDENCE.best_of_available; }
+      var _cProbed = (_cStatus !== 'not_probed');
       return _finalize(lead, {
         email: constructed.email,
-        confidence: _FINALIZER_TIER_CONFIDENCE.constructed,
-        tier: 'constructed',
-        source: 'finalizer_constructed_' + constructed.method,
+        confidence: _cConf,
+        tier: _cTier,
+        source: 'finalizer_constructed_' + constructed.method + (_cProbed ? '_reoon_' + _cStatus : ''),
         domain: constructed.domain || (constructed.email.split('@')[1] || ''),
         candidates: [constructed.email],
         runnerUps: [],
-        reasoning: 'constructed_via_' + constructed.method + '_using_' + (constructed.domainSource || 'unknown_domain_source'),
+        reoonStatus: _cProbed ? _cStatus : undefined,
+        // When the org-token gate was BYPASSED by a Reoon-safe verdict, attach explicit
+        // flags so [VERIFY] fires with a visible reason ("confirm CURRENT employer") and
+        // the override is auditable — deliverability proved the mailbox EXISTS, not that
+        // the domain is the lead's current employer.
+        extraRiskFlags: _bypassedGate ? ['org_gate_bypassed_by_reoon_safe', 'org_recipient_mismatch'] : undefined,
+        reasoning: 'constructed_via_' + constructed.method + '_using_' + (constructed.domainSource || 'unknown_domain_source') +
+                   (constructed.patternUsed ? ' pattern=' + constructed.patternUsed + '(' + (constructed.patternTier || '?') + ')' : '') +
+                   (_cProbed ? ' reoon=' + _cStatus : '') +
+                   (_bypassedGate ? ' org_gate_bypassed_reoon_safe' : ''),
         synthetic: true,
         domainConfidence: constructed.domainConfidence || 0
       });
@@ -811,6 +1048,39 @@ function _constructFromPrimitives(lead) {
     fn = lead.fullName.toString().split(/\s+/)[0].toLowerCase().replace(/[^a-z]/g, '');
   }
 
+  // ── #1a KNOWN-PATTERN REUSE (2026-06-24, DOMAIN_PATTERN_REUSE_ENABLED opt-out '0') ──
+  // Before defaulting to the blind {first}.{last} guess, consult the domain's KNOWN
+  // email pattern (curated map / self_observed ground truth / previously-discovered).
+  // LOOKUP-ONLY: this never triggers live Hunter/GitHub/Gemini discovery in the hot
+  // fallback path. A self_observed first.last@colgate (learned from a prior confirmed
+  // Colgate lead) makes the NEXT Colgate guess evidence-backed instead of invented.
+  var _patReuse = true;
+  try { _patReuse = (PropertiesService.getScriptProperties().getProperty('DOMAIN_PATTERN_REUSE_ENABLED') !== '0'); } catch (_prErr) {}
+  if (_patReuse && fn && typeof discoverDomainPattern === 'function' && typeof _applyEmailPattern === 'function') {
+    try {
+      var _dp = discoverDomainPattern(domain, true);  // lookupOnly=true → cached/curated only
+      // Trust ONLY a corroborated pattern: curated map, self_observed ground truth, or a
+      // multi-source dynamic discovery (>=0.70). A single-source Gemini guess (cached at
+      // 0.62) is NOT more trustworthy than the {first}.{last} default → let it fall through.
+      if (_dp && _dp.pattern &&
+          (_dp.tier === 'curated' || _dp.tier === 'self_observed' || (_dp.confidence || 0) >= 0.70)) {
+        var _patEmail = _applyEmailPattern(_dp.pattern, fn, ln, domain);
+        if (_patEmail && _patEmail.indexOf('@') > 0) {
+          return {
+            email: _patEmail,
+            method: 'pattern_' + _dp.pattern.replace(/[{}]/g, '') + '_from_' + (_dp.tier || 'known'),
+            domain: domain,
+            domainSource: domainSource,
+            domainConfidence: domainConfidence,
+            patternUsed: _dp.pattern,
+            patternTier: _dp.tier || 'known',
+            patternConfidence: _dp.confidence || 0
+          };
+        }
+      }
+    } catch (_patErr) { /* known-pattern lookup is best-effort; fall through to default */ }
+  }
+
   if (fn && ln) {
     return {
       email: fn + '.' + ln + '@' + domain,
@@ -862,11 +1132,87 @@ function _lastResortPlaceholder(lead) {
   };
 }
 
+// ─── #2 CONSTRUCTED-EMAIL DELIVERABILITY PROBE ─────────────────────────────
+/**
+ * Probe a fabricated/constructed guess with Reoon BEFORE finalizing it, so the
+ * tier ladder can elevate a deliverable guess and flag a dead one. Safe by
+ * construction: verifyEmailDeliverable is cache-backed and self-guards the daily
+ * Reoon circuit breaker + quick-mode quota, returning 'skipped' when the key /
+ * quota / breaker is unavailable. We translate 'skipped' (and any throw / disabled
+ * kill-switch / missing verifier) to 'not_probed' so the caller keeps the exact
+ * pre-probe behavior (constructed 0.20). NEVER throws.
+ *
+ * Kill-switch: ScriptProperty CONSTRUCTED_PROBE_ENABLED='0' disables the probe.
+ *
+ * @param {string} email
+ * @returns {Object} { status: 'safe'|'role_account'|'catch_all'|'invalid'|'unknown'|'not_probed', raw? }
+ */
+function _probeConstructedEmail_(email) {
+  if (!email) return { status: 'not_probed', reason: 'empty' };
+  var enabled = true;
+  try { enabled = (PropertiesService.getScriptProperties().getProperty('CONSTRUCTED_PROBE_ENABLED') !== '0'); } catch (_pe) {}
+  if (!enabled) return { status: 'not_probed', reason: 'probe_disabled' };
+  if (typeof verifyEmailDeliverable !== 'function') return { status: 'not_probed', reason: 'verifier_unavailable' };
+  try {
+    var rv = verifyEmailDeliverable(email);
+    var st = (rv && rv.status) || 'unknown';
+    // 'skipped' = no key / daily breaker / quick-quota exhausted → behave as unprobed
+    // (we have NO signal, so neither elevate nor downgrade the guess). Log it (adversarial-
+    // review @286): a batch of Tier-3 leads silently degrading to constructed(0.20) because
+    // Reoon ran dry should be diagnosable, not invisible.
+    if (st === 'skipped') {
+      Logger.log('[EmailFinalizer] constructed-probe SKIPPED for ' + email + ' (' +
+                 ((rv && rv.reason) || 'reoon_skipped') + ') → unprobed, falls back to constructed(0.20)');
+      return { status: 'not_probed', reason: (rv && rv.reason) || 'reoon_skipped' };
+    }
+    return { status: st, raw: rv };
+  } catch (e) {
+    return { status: 'not_probed', reason: 'probe_threw_' + e.message };
+  }
+}
+
 // ─── COMMON FINALIZER + STATE MUTATION ─────────────────────────────────────
 
 function _finalize(lead, payload) {
   var tier = payload.tier;
   var riskFlags = (_FINALIZER_TIER_RISK[tier] || []).slice();
+  // Probe/bypass paths may attach extra risk flags (e.g. org_gate_bypassed_by_reoon_safe)
+  // so the [VERIFY] reason is explicit + auditable. Additive only — base tier flags intact.
+  if (payload.extraRiskFlags && payload.extraRiskFlags.length) {
+    payload.extraRiskFlags.forEach(function(_xf) { if (riskFlags.indexOf(_xf) < 0) riskFlags.push(_xf); });
+  }
+
+  // ── EDU-INSTITUTION / ALMA-MATER GUARD (-p6-edu-guard) ─────────────────────
+  // A school/university as the "current employer" of a cold-outreach lead is
+  // almost always the ALMA MATER, not the job (the recurring "Nikhil = Jaipuria
+  // Institute of Management" class). This SERVER-SIDE backstop catches it
+  // regardless of the app build (the app-side edu-guard ships only in a rebuilt
+  // APK) AND regardless of Apollo (the org-arbitration cross-check, which is
+  // exhaustible). Conservative: FLAG [VERIFY] on academic org TEXT, but only
+  // HOLD (blank) the email when the email itself is at an academic domain
+  // (.edu/.ac.<cc>) — the unambiguous alma-mater mailbox. A school-NAMED company
+  // ("Mesa School of Business" / mesaschool.co) has a non-academic domain, so
+  // its email is never held. Kill-switch: EDU_ORG_GUARD_ENABLED='0'.
+  try {
+    if (PropertiesService.getScriptProperties().getProperty('EDU_ORG_GUARD_ENABLED') !== '0') {
+      var _emailAcademic = (typeof _emailDomainIsAcademic_ === 'function') && _emailDomainIsAcademic_(payload.email);
+      var _orgAcademic   = (typeof _orgTextLooksAcademic_ === 'function') && _orgTextLooksAcademic_(lead.organization);
+      if (_emailAcademic || _orgAcademic) {
+        if (riskFlags.indexOf('probable_alma_mater_org') < 0) riskFlags.push('probable_alma_mater_org');
+        if (riskFlags.indexOf('verify_recipient_before_send') < 0) riskFlags.push('verify_recipient_before_send');
+        Logger.log('[EmailFinalizer] EDU-GUARD org="' + (lead.organization || '') + '" email=' +
+                   payload.email + ' academicEmail=' + _emailAcademic + ' academicOrg=' + _orgAcademic + ' -> [VERIFY]');
+        if (_emailAcademic) {
+          // Email is at the school's OWN domain -> alma-mater mailbox, wrong for a
+          // job-seeker. Hold it so we never draft to it; lead falls to NEEDS_EMAIL.
+          if (riskFlags.indexOf('alma_mater_email_held') < 0) riskFlags.push('alma_mater_email_held');
+          payload.email = '';
+          payload.confidence = 0;
+          payload.reasoning = (payload.reasoning || '') + ' | EDU-GUARD held academic-domain email (probable alma mater)';
+        }
+      }
+    }
+  } catch (_eduErr) { Logger.log('[EmailFinalizer] edu-guard skipped: ' + _eduErr.message); }
 
   // Mutate lead so downstream stages see the chosen email + tier
   lead.email = payload.email;
@@ -878,6 +1224,34 @@ function _finalize(lead, payload) {
   Logger.log('[EmailFinalizer] Row ' + (lead.rowNum || '?') + ' tier=' + tier +
              ' conf=' + payload.confidence.toFixed(2) + ' email=' + payload.email +
              ' source=' + payload.source + ' reasoning=' + payload.reasoning);
+
+  // ── #1b SELF-LEARNING (2026-06-24, DOMAIN_PATTERN_LEARN_ENABLED opt-out '0') ──
+  // When we land a GROUND-TRUTH-confirmed address — Reoon 'safe' (the SPECIFIC mailbox
+  // exists) or a human-locked email (source 'user_verified') — infer the domain's email
+  // pattern and record it as 'self_observed' so the NEXT same-domain lead constructs the
+  // right format instead of a blind {first}.{last}. catch_all / role_account / unknown are
+  // NOT ground truth (a catch_all domain "accepts" anything) → not learned. Freemail excluded.
+  try {
+    var _learnOn = (PropertiesService.getScriptProperties().getProperty('DOMAIN_PATTERN_LEARN_ENABLED') !== '0');
+    var _ldom = (payload.domain || '').toString().toLowerCase().trim();
+    var _isFree = (typeof FREE_EMAIL_DOMAINS !== 'undefined' && !!FREE_EMAIL_DOMAINS[_ldom]);
+    // GROUND TRUTH for pattern learning = Reoon 'safe' (the SPECIFIC mailbox exists), full
+    // stop. This is the only signal reliable enough to generalize a domain's format to OTHER
+    // people (adversarial-review @286):
+    //   • Captures verified-tier safe (sheet_captured / selector) AND probe-elevated
+    //     constructed-safe (which lands at tier low_confidence) — so a Reoon-confirmed guess
+    //     teaches the domain and the NEXT same-domain lead reuses it (no re-probe, saves a credit).
+    //   • EXCLUDES source==='user_verified': human email locks can be stale/bounced (Aditi
+    //     pepsico.com, Samriddhi lendbox.in BOUNCED) — trusted for THAT lead's recipient, NOT
+    //     as a domain-wide pattern.
+    //   • EXCLUDES catch_all / role_account / unknown — not mailbox confirmation.
+    var _groundTruth = (payload.reoonStatus === 'safe');
+    if (_learnOn && _groundTruth && _ldom && !_isFree && typeof _recordObservedPattern_ === 'function') {
+      _recordObservedPattern_(_ldom, lead.firstName, lead.lastName, payload.email);
+    }
+  } catch (_learnErr) {
+    Logger.log('[EmailFinalizer] pattern self-learn skipped: ' + _learnErr.message);
+  }
 
   return {
     status: 'VERIFIED',  // always VERIFIED status post-finalize so BatchProcessor proceeds
@@ -897,6 +1271,39 @@ function _finalize(lead, payload) {
     domainConfidence: payload.domainConfidence || 0,
     classification: 'CORPORATE'
   };
+}
+
+// ── EDU-GUARD detectors (-p6-edu-guard) ──────────────────────────────────────
+// Pure, side-effect-free. Kept narrow on purpose: the AGGRESSIVE action (blank
+// the email) fires only on _emailDomainIsAcademic_, which can never be a company
+// domain; the org-text detector only adds a [VERIFY] flag, so its rare false
+// positives ("Hamburger University") cost a review, never a dropped email.
+
+// TRUE when the email's domain is an academic mailbox: x.edu (US), or any
+// x.ac.<cc> / x.edu.<cc> (ac.in, ac.uk, edu.in, edu.au ...). This is the
+// unambiguous "alma-mater address" signal — a job-seeker is not reachable there.
+function _emailDomainIsAcademic_(email) {
+  var e = (email || '').toString().toLowerCase().trim();
+  var at = e.indexOf('@');
+  if (at < 0) return false;
+  var dom = e.slice(at + 1);
+  if (!dom) return false;
+  return /\.edu$/.test(dom) || /\.edu\.[a-z]{2,3}$/.test(dom) || /\.ac\.[a-z]{2,3}$/.test(dom);
+}
+
+// TRUE when the org TEXT strongly reads as an education institution (the alma
+// mater wrongly captured as "current employer" — the Jaipuria/Nikhil class).
+// Deliberately excludes bare "school of X" so school-NAMED companies like
+// "Mesa School of Business" (mesaschool.co) are NOT flagged.
+function _orgTextLooksAcademic_(org) {
+  var o = (org || '').toString().toLowerCase();
+  if (!o) return false;
+  return /\buniversity\b/.test(o)
+      || /\bvishwavidyalaya\b/.test(o)
+      || /\bvidyalaya\b/.test(o)
+      || /\bpolytechnic\b/.test(o)
+      || /\binstitute of (management|technology|science|sciences|engineering|business|studies|education)\b/.test(o)
+      || /\b(iit|iim|nit|iiit|bits|xlri|isb|nift|nid)\b/.test(o);
 }
 
 function _finalizerEmptyResult(reason, tier) {

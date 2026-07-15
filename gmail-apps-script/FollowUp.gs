@@ -142,6 +142,11 @@ function _composeFollowUp(lead, originalSubject, dossier, classification, framew
   var prompt = [
     '<role>You are Gaurav Rathore writing a Day-' + offsetDay + ' follow-up in an existing email thread. The recipient got your initial email ' + offsetDay + ' days ago and did not reply.</role>',
     '',
+    '<sender>',
+    '  <name>Gaurav Rathore</name>',
+    '  <current_company>Blinkit Bistro</current_company>',
+    '</sender>',
+    '',
     '<recipient>',
     '  <name>' + firstName + '</name>',
     '  <company>' + company + '</company>',
@@ -166,6 +171,7 @@ function _composeFollowUp(lead, originalSubject, dossier, classification, framew
     '  - Middle sentence: tie the signal to the recipient\'s likely pain or opportunity. If stage=2, cite ONE specific metric from Gaurav\'s verified achievements (e.g., "94% complaint drop on 121K orders at Blinkit Bistro").',
     '  - Close with ONE low-commitment question the recipient can answer in 15 seconds, OR (if stage=3) a graceful door-closer with no ask.',
     '  - Do NOT include ANY placeholder tokens like [NAME], [COMPANY], [INSIGHT], [PROOF_POINT], [FINAL_CTA]. Write the actual text.',
+    '  - EMPLOYER FACTS — never swap: GAURAV (the sender) works at Blinkit Bistro. ' + firstName + ' (the recipient) works at ' + company + '. NEVER imply Gaurav works at ' + company + ', and NEVER imply ' + firstName + ' works at Blinkit Bistro. If a signal mentions a PAST shared employer, attribute it to the correct person.',
     '  - Do NOT repeat the original subject line or phrases from the original email.',
     '  - Sign off: "Gaurav" on its own line. No title, no LinkedIn URL (the signature is added separately).',
     '</rules>',
@@ -383,7 +389,7 @@ function processScheduledFollowUps() {
     //
     // Pass 1: Collect all due PENDING rows, mark superseded duplicates.
     var dueRows = [];       // { rowIdx, email, stage, scheduledDateMs }
-    var pendingGroups = {}; // email|stage -> [{ rowIdx, scheduledDateMs }]
+    var pendingGroups = {}; // identity|stage -> [{ rowIdx, scheduledDateMs }]
 
     for (var scanI = 1; scanI < data.length; scanI++) {
       var scanRow = data[scanI];
@@ -399,7 +405,10 @@ function processScheduledFollowUps() {
         scanFireMs = new Date(scanRow[col.scheduledDate]).getTime() || 0;
       }
 
-      var groupKey = scanEmail + '|' + scanStage;
+      // -p7-followup-identity: group by STABLE identity (ParentRow) not email, so
+      // two sets scheduled under different emails for the SAME lead collapse.
+      var scanParentRow = col.parentRow >= 0 ? scanRow[col.parentRow] : '';
+      var groupKey = _fuIdentityKey_(scanParentRow, scanEmail) + '|' + scanStage;
       if (!pendingGroups[groupKey]) pendingGroups[groupKey] = [];
       pendingGroups[groupKey].push({ rowIdx: scanI, scheduledDateMs: scanFireMs });
     }
@@ -449,9 +458,13 @@ function processScheduledFollowUps() {
 
       if (!leadEmail || !body) { skipped++; continue; }
 
+      // -p7-followup-identity: one-per-run gate keyed on STABLE identity (ParentRow),
+      // so the same lead can't fire two threads in one run under two different emails.
+      var fireIdentity = _fuIdentityKey_(col.parentRow >= 0 ? row[col.parentRow] : '', leadEmail);
+
       // FIX 3b (i): one-per-run per lead — skip if a higher-priority (lower-stage) row
-      // for this email already fired this run
-      if (firedThisRun[leadEmail.toLowerCase()]) {
+      // for this lead already fired this run
+      if (firedThisRun[fireIdentity]) {
         skipped++;
         continue;
       }
@@ -529,6 +542,21 @@ function processScheduledFollowUps() {
       // ── Create threaded follow-up via unified rate-limited path ──
       // FIX 4 (2026-06-13-followup-thread): Do NOT pass subject — thread inherits it.
       try {
+        // -p7-followup-identity: if the STORED body is a frozen static-fallback
+        // (composed while Claude was unreachable → generic, same for everyone),
+        // re-compose a fresh personalized body now that Claude may be back. Fails
+        // safe: if re-compose is unavailable/still-degraded, the stored body ships.
+        if (_fuLazyRecomposeEnabled_() && _fuBodyLooksLikeFallback_(body)) {
+          var _freshBody = _fuRecomposeStageBody_(parentLead, stage);
+          if (_freshBody) {
+            body = _freshBody;
+            if (col.body >= 0) {
+              try { followupsSheet.getRange(i + 1, col.body + 1).setValue(body); } catch (_) {}
+            }
+            Logger.log('[FollowUp] re-composed frozen fallback body at fire time for row ' + (i + 1));
+          }
+        }
+
         var result = createFollowUpDraft(
           parentLead,
           stage,
@@ -548,8 +576,8 @@ function processScheduledFollowUps() {
             followupsSheet.getRange(i + 1, col.notes + 1).setValue('draftId=' + result.draftId);
           }
 
-          // Mark as fired for this run (one-per-run gate)
-          firedThisRun[leadEmail.toLowerCase()] = true;
+          // Mark as fired for this run (one-per-run gate, keyed on stable identity)
+          firedThisRun[fireIdentity] = true;
 
           // Update parent lead's follow-up stage status in DATA_SHEET
           // PATCH Phase 8 (F-33 fix): URL-keyed write to defend against Sheet2
@@ -627,6 +655,66 @@ function processScheduledFollowUps() {
 }
 
 // ─── HELPERS ─────────────────────────────────────────────
+
+// ── STABLE-IDENTITY FOLLOW-UP DEDUP (-p7-followup-identity) ─────────────────
+// The recurring "2 follow-up threads for one lead" bug (Samriddhi Gupta:
+// Wishlink→Lendbox) is caused by dedup keying on EMAIL, which is MUTABLE. When
+// a lead's email is corrected/re-enriched, a second follow-up set is scheduled
+// under the new email key and BOTH fire. ParentRow (the Sheet2 row) is STABLE
+// across email/org corrections, so keying on it collapses the two sets. Falls
+// back to email for legacy rows without a ParentRow. Kill-switch: '0'.
+function _fuDedupByParentRowEnabled_() {
+  try { return PropertiesService.getScriptProperties().getProperty('FOLLOWUP_DEDUP_BY_PARENTROW') !== '0'; }
+  catch (_) { return true; }
+}
+function _fuIdentityKey_(parentRowVal, emailVal) {
+  if (_fuDedupByParentRowEnabled_()) {
+    var pr = parseInt(parentRowVal, 10);
+    if (pr && pr > 1) return 'row:' + pr;
+  }
+  return 'email:' + (emailVal || '').toString().trim().toLowerCase();
+}
+
+// TRUE when a stored follow-up body is one of the static _fallbackFollowUp
+// templates (composed while Claude was unreachable → frozen generic pitch,
+// same for every recipient). Used at fire time to re-compose a fresh,
+// personalized body once Claude is back rather than shipping the frozen one.
+function _fuBodyLooksLikeFallback_(body) {
+  var b = (body || '').toString();
+  if (!b) return false;
+  return b.indexOf('tightened 13 ops variables') >= 0
+      || b.indexOf('40% ops quality gap to near-zero') >= 0
+      || b.indexOf('Last note from me') >= 0
+      || b.indexOf('wanted to add one thing I left out') >= 0;
+}
+function _fuLazyRecomposeEnabled_() {
+  try { return PropertiesService.getScriptProperties().getProperty('FOLLOWUP_LAZY_RECOMPOSE') !== '0'; }
+  catch (_) { return true; }
+}
+
+// Re-compose a single follow-up stage at FIRE time from the parent lead's stored
+// research, so a frozen fallback body is replaced with a fresh personalized one.
+// Returns the fresh body string, or '' if re-compose is unavailable/failed
+// (caller keeps the stored body — graceful degradation).
+function _fuRecomposeStageBody_(parentLead, stage) {
+  try {
+    if (typeof _composeFollowUp !== 'function' || typeof _getFrameworkForStage !== 'function') return '';
+    var dossier = {};
+    try { if (parentLead.researchJson) dossier = JSON.parse(parentLead.researchJson); } catch (_) {}
+    var framework = _getFrameworkForStage(stage);
+    var pool = (typeof _buildSignalPool === 'function') ? _buildSignalPool(dossier) : [];
+    var signal = pool.length ? pool[(stage - 1) % pool.length] : null;
+    var origSubj = parentLead.subject || parentLead.subjectLine ||
+                   ('Job Application' + (parentLead.organization ? ' | ' + parentLead.organization : ''));
+    var fresh = _composeFollowUp(parentLead, origSubj, dossier, null, framework, stage, signal);
+    if (fresh && fresh.body && fresh.body.length > 30 && !_fuBodyLooksLikeFallback_(fresh.body)) {
+      return fresh.body;
+    }
+  } catch (e) {
+    Logger.log('[FollowUp] lazy re-compose failed (keeping stored body): ' + e.message);
+  }
+  return '';
+}
 
 /**
  * Reads the STATUS column for a lead from Sheet2 immediately before creating

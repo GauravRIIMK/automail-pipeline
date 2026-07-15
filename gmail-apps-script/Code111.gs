@@ -20,7 +20,7 @@
  * Useful for backfilling existing LinkedIn data into the pipeline.
  */
 function syncSheet1ToSheet2() {
-  var ss = SpreadsheetApp.openById('YOUR_GOOGLE_SHEET_ID');
+  var ss = SpreadsheetApp.openById('1ZMg0NychDnNqfD0DfVIqWZmzrGik5EFIdaaeJQWMsvY');
   var sheet1 = ss.getSheetByName('Sheet1');
   var sheet2 = ss.getSheetByName('Sheet2');
 

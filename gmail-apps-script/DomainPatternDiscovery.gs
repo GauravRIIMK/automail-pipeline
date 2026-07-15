@@ -45,7 +45,7 @@ var DDPD_NEG_TTL_DAYS = 1;   // re-discover negative (no pattern) entries after 
  * @param {string} domain  e.g., 'amazon.com'
  * @returns {Object|null} { pattern, confidence, sources, cached, sampleEmails }
  */
-function discoverDomainPattern(domain) {
+function discoverDomainPattern(domain, lookupOnly) {
   if (!domain) return null;
   domain = domain.toLowerCase().trim();
 
@@ -63,6 +63,15 @@ function discoverDomainPattern(domain) {
   // ─── Tier 2: dynamic-learned cache ──
   var cached = _ddpdLoadFromSheet(domain);
   if (cached) {
+    // ★SELF-OBSERVED GROUND TRUTH (2026-06-24): a pattern inferred from one of OUR OWN
+    // pipeline-confirmed addresses (Reoon 'safe' on a real mailbox, or a human-locked
+    // email) is ground truth, not a web guess. It NEVER expires and always wins — a
+    // later Hunter/Gemini guess must not override what we have directly observed.
+    if ((cached.sources || []).indexOf('self_observed') >= 0 && cached.pattern) {
+      cached.cached = true;
+      cached.tier = 'self_observed';
+      return cached;
+    }
     // Honor TTL — positive hits (pattern found) expire after DDPD_TTL_DAYS (90d);
     // negative hits (no pattern) expire after DDPD_NEG_TTL_DAYS (1d) so a new
     // employer email format discovered tomorrow doesn't stay suppressed for 90 days.
@@ -77,6 +86,12 @@ function discoverDomainPattern(domain) {
     Logger.log('[DDPD] cached entry for ' + domain + ' is ' + ageDays.toFixed(0) + 'd old' +
                ' (ttl=' + ttlDays + 'd, ' + (cachedPattern ? 'positive' : 'negative') + '), re-discovering');
   }
+
+  // ─── LOOKUP-ONLY (2026-06-24): callers on a hot/fallback path (e.g. the email
+  // finalizer's constructed tier) want only the CHEAP cached/curated answer — they
+  // must NOT trigger live Hunter/GitHub/Gemini discovery (slow + spends API quota)
+  // and must NOT write a negative-cache row. Return null so the caller falls back. ──
+  if (lookupOnly) return null;
 
   // ─── Tier 3: live ensemble discovery ──
   var discovery = _ddpdLiveDiscover(domain);
@@ -307,6 +322,30 @@ function _ddpdSaveToSheet(domain, discovery) {
       (discovery.sampleEmails || []).slice(0, 5).join(' | ')
     ];
     if (existingRow > 0) {
+      // ★PRESERVE GROUND TRUTH (2026-06-24): never let a non-self_observed discovery
+      // (Hunter/GitHub/Gemini guess) overwrite a self_observed (pipeline-confirmed)
+      // pattern. Self_observed → self_observed is allowed (refresh sample/timestamp).
+      var _existingSources = (sheet.getRange(existingRow, 4).getValue() || '').toString();
+      var _incomingIsSelf = (discovery.sources || []).indexOf('self_observed') >= 0;
+      if (_existingSources.indexOf('self_observed') >= 0 && !_incomingIsSelf) {
+        Logger.log('[DDPD] preserving self_observed pattern for ' + domain +
+                   ' — refused overwrite by [' + (discovery.sources || []).join(',') + ']');
+        return;
+      }
+      // ★CONFLICT GUARD (adversarial-review @286): two self_observed observations at the
+      // same domain with DIFFERENT inferred patterns → KEEP THE FIRST. Last-write-wins would
+      // let one unusual address (a contractor, a legacy mailbox) flip an established pattern
+      // with no majority vote. Identical pattern → harmless refresh, allowed.
+      if (_existingSources.indexOf('self_observed') >= 0 && _incomingIsSelf) {
+        var _existingPattern = (sheet.getRange(existingRow, 2).getValue() || '').toString();
+        var _incomingPattern = (discovery.pattern || '').toString();
+        if (_existingPattern && _incomingPattern && _existingPattern !== _incomingPattern) {
+          Logger.log('[DDPD] self_observed CONFLICT for ' + domain + ': keeping "' + _existingPattern +
+                     '", refused replacement by "' + _incomingPattern + '" (sample ' +
+                     ((discovery.sampleEmails || [])[0] || '?') + ')');
+          return;
+        }
+      }
       sheet.getRange(existingRow, 1, 1, 6).setValues([row]);
     } else {
       sheet.appendRow(row);
@@ -323,4 +362,134 @@ function ddpdTest(domain) {
     discovery: result,
     cachedNow: !!(result && result.cached)
   };
+}
+
+// ─── PATTERN ↔ EMAIL (2026-06-24, accuracy increment #1) ─────────────────────
+//
+// Two pure helpers + a self-learning recorder that, together, let the email
+// finalizer's constructed tier build the RIGHT local-part format for a domain
+// (from its KNOWN pattern) instead of a blind {first}.{last}, AND grow the
+// pattern map from our own pipeline-confirmed addresses (self_observed).
+
+/**
+ * Build an email address from a canonical pattern token + name parts.
+ * Returns '' when it can't (no first name / unknown token / no domain).
+ * The token vocabulary matches _ddpdNormalizePattern's canonical outputs.
+ *
+ * @param {string} pattern  e.g. '{first}.{last}'
+ * @param {string} fn        first name (already lowercased a-z, but we re-clean)
+ * @param {string} ln        last name (may be empty)
+ * @param {string} domain    e.g. 'acme.com'
+ * @returns {string} 'john.doe@acme.com' or ''
+ */
+function _applyEmailPattern(pattern, fn, ln, domain) {
+  if (!pattern || !domain) return '';
+  fn = (fn || '').toString().toLowerCase().replace(/[^a-z]/g, '');
+  ln = (ln || '').toString().toLowerCase().replace(/[^a-z]/g, '');
+  if (!fn) return '';
+  var fi = fn.charAt(0);
+  var li = ln ? ln.charAt(0) : '';
+  var lp;
+  switch (pattern) {
+    case '{first}.{last}': lp = ln ? (fn + '.' + ln) : fn; break;
+    case '{f}{last}':      lp = ln ? (fi + ln) : fn; break;
+    case '{first}{last}':  lp = ln ? (fn + ln) : fn; break;
+    case '{first}_{last}': lp = ln ? (fn + '_' + ln) : fn; break;
+    case '{first}.{l}':    lp = ln ? (fn + '.' + li) : fn; break;
+    case '{last}.{first}': lp = ln ? (ln + '.' + fn) : fn; break;
+    case '{f}.{last}':     lp = ln ? (fi + '.' + ln) : fn; break;
+    case '{last}{f}':      lp = ln ? (ln + fi) : fn; break;
+    case '{first}':        lp = fn; break;
+    default: return '';   // unknown token → caller falls back to its default
+  }
+  return lp + '@' + domain.toString().toLowerCase().trim();
+}
+
+/**
+ * Reverse of _applyEmailPattern: given a CONFIRMED address + the person's name,
+ * infer which canonical pattern produced it. Returns null when the local-part
+ * doesn't match any known pattern (nickname / random / role account) — we
+ * deliberately DON'T learn from those (they'd pollute the map for other people).
+ *
+ * @param {string} email   'john.doe@acme.com'
+ * @param {string} fn      first name
+ * @param {string} ln      last name (may be empty)
+ * @returns {string|null}  '{first}.{last}' etc., or null
+ */
+function _inferEmailPattern_(email, fn, ln) {
+  if (!email) return null;
+  var _rawLp = (email.toString().split('@')[0] || '').toLowerCase();
+  // A digit in the local-part is almost always a personal DISAMBIGUATION suffix
+  // (john.doe2, rkumar7) — NOT a company-wide format. Don't learn/generalize from it
+  // (adversarial-review @286: stripping digits would mis-learn 'john1' as '{first}').
+  if (/[0-9]/.test(_rawLp)) return null;
+  var lp = _rawLp.replace(/[^a-z._]/g, '');
+  fn = (fn || '').toString().toLowerCase().replace(/[^a-z]/g, '');
+  ln = (ln || '').toString().toLowerCase().replace(/[^a-z]/g, '');
+  if (!lp || !fn) return null;
+  var fi = fn.charAt(0);
+  var li = ln ? ln.charAt(0) : '';
+  if (ln) {
+    if (lp === fn + '.' + ln) return '{first}.{last}';
+    if (lp === fi + ln)       return '{f}{last}';
+    if (lp === fn + ln)       return '{first}{last}';
+    if (lp === fn + '_' + ln) return '{first}_{last}';
+    if (lp === fn + '.' + li) return '{first}.{l}';
+    if (lp === ln + '.' + fn) return '{last}.{first}';
+    if (lp === fi + '.' + ln) return '{f}.{last}';
+    if (lp === ln + fi)       return '{last}{f}';
+  }
+  if (lp === fn) return '{first}';
+  return null;
+}
+
+/**
+ * Learn the email pattern for a domain from a GROUND-TRUTH-confirmed address
+ * (Reoon-'safe' mailbox, or a human-locked email). Upserts the DomainPatterns
+ * sheet with source 'self_observed' (highest trust, non-expiring). Cheap:
+ *   - dedup-guarded to at most one learn-write per domain per 12h (CacheService)
+ *   - skips unrecognized local-parts (nicknames) so the map stays clean
+ *   - skips if the same self_observed pattern is already recorded
+ *
+ * @returns {boolean} true if a new/updated self_observed row was written
+ */
+function _recordObservedPattern_(domain, fn, ln, email) {
+  if (!domain || !email) return false;
+  domain = domain.toString().toLowerCase().trim();
+  var guardKey = 'OBSPAT_' + domain;
+  try {
+    if (typeof CacheService !== 'undefined') {
+      var c0 = CacheService.getScriptCache();
+      if (c0 && c0.get(guardKey)) return false;   // learned for this domain recently
+    }
+  } catch (_g) {}
+
+  var pat = _inferEmailPattern_(email, fn, ln);
+  if (!pat) return false;   // unrecognized local-part — don't pollute the map
+
+  // Don't churn the sheet if this exact self_observed pattern is already recorded.
+  try {
+    var existing = (typeof _ddpdLoadFromSheet === 'function') ? _ddpdLoadFromSheet(domain) : null;
+    if (existing && existing.pattern === pat &&
+        (existing.sources || []).indexOf('self_observed') >= 0) {
+      try { CacheService.getScriptCache().put(guardKey, '1', 12 * 3600); } catch (_p1) {}
+      return false;
+    }
+  } catch (_e1) {}
+
+  try {
+    _ddpdSaveToSheet(domain, {
+      pattern: pat,
+      confidence: 0.95,
+      sources: ['self_observed'],
+      sampleEmails: [email.toString().toLowerCase()],
+      discoveredAtMs: Date.now()
+    });
+    try { CacheService.getScriptCache().put(guardKey, '1', 12 * 3600); } catch (_p2) {}
+    Logger.log('[DDPD] self_observed pattern LEARNED: ' + domain + ' → ' + pat + ' (from ' + email + ')');
+    return true;
+  } catch (e) {
+    Logger.log('[DDPD] self_observed save failed for ' + domain + ': ' + e.message);
+    return false;
+  }
 }

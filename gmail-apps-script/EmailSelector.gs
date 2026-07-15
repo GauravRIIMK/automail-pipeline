@@ -324,7 +324,9 @@ function selectBestEmail(lead) {
  * Multiple variants within the same type count as one for diversity.
  *
  *   apollo_*          → apollo   (Apollo people/orgs — one upstream API)
- *   apk_provided      → apk      (User-extracted from LinkedIn DOM)
+ *   apk_provided      → pattern  (F4 2026-06-23: collapsed into 'pattern' — a DOM-scraped
+ *                                 email is correlated with a same-address pattern guess,
+ *                                 NOT independent corroboration. Unconditional, not flag-gated.)
  *   hunter_finder     → hunter   (Hunter Email Finder API)
  *   pattern_*         → pattern  (Heuristic pattern guess at resolved domain)
  *   mx_dominant       → mx       (Dominant pattern observed at the domain)
@@ -334,11 +336,18 @@ function _sourceType(sourceName) {
   var n = sourceName.toString().toLowerCase();
   if (n.indexOf('apollo') === 0) return 'apollo';
   if (n.indexOf('apk') === 0) {
-    // G2 (ENRICHMENT_SOURCETYPE_V2): collapse apk into 'pattern'. A DOM-scraped
-    // email and a pattern-guess that agree are CORRELATED (both reflect the same
-    // dominant-pattern hypothesis), not independent corroboration — so they must
-    // be ONE type, not two (closes A16). Flag OFF → legacy 'apk' (distinct).
-    return _enrichmentFlag('ENRICHMENT_SOURCETYPE_V2') ? 'pattern' : 'apk';
+    // PATCH 2026-06-23 (F4 email-core): collapse apk -> 'pattern' UNCONDITIONALLY.
+    // A DOM-scraped APK email and a pattern guess that produce the SAME address are
+    // CORRELATED (both reflect the dominant-pattern hypothesis at the resolved
+    // domain), not independent corroboration. Counting them as 2 distinct types
+    // manufactured a false diversity-2 boost (x1.4 + floor 0.55) -> shipping Tier0
+    // VERIFIED with NO [VERIFY] prefix despite zero independent confirmation (the
+    // A16 class; the largest high-confidence-bounce risk in the 2026-06-23
+    // baseline). This was previously gated on the ENRICHMENT_SOURCETYPE_V2
+    // ScriptProperty being promoted; making it the CODE DEFAULT means a property
+    // reset can no longer silently re-open the hole. apk + apollo (genuinely
+    // independent) still counts as 2 types and still earns the boost.
+    return 'pattern';
   }
   if (n.indexOf('hunter') === 0) return 'hunter';
   if (n.indexOf('pattern') === 0) return 'pattern';
@@ -517,6 +526,16 @@ function _gatherSignals(lead, gathering) {
     dominantPatternByDomain: {},
     orgDomain: gathering.orgDomain
   };
+
+  // G3 (2026-06-22): populate per-address hard-bounce suppression from the durable
+  // store so the selector never re-drafts an exact previously-bounced mailbox.
+  try {
+    var _bouncedAddrs = (typeof getBouncedAddressesMap === 'function') ? getBouncedAddressesMap() : {};
+    Object.keys(_bouncedAddrs).forEach(function(_a) {
+      var _h = (_bouncedAddrs[_a] && _bouncedAddrs[_a].hard) || 0;
+      if (_h >= 1) { signals.hardBounceByAddress[_a] = _h; }
+    });
+  } catch (_bErr) {}
 
   // Collect unique domains to query
   var uniqueDomains = {};
@@ -757,6 +776,13 @@ function _scoreCandidate(candidate, lead, signals) {
   if (bouncePen > 0) {
     var bp = Math.min(30, Math.round(bouncePen * 200));
     score -= bp; reasons.push('bounce_history -' + bp);
+  }
+  // G3 (2026-06-22): UNCONDITIONAL per-ADDRESS hard-bounce suppression — never
+  // re-draft an exact address that previously hard-bounced (reputation). Additive
+  // and independent of the domain-level ENRICHMENT_BOUNCE_V2 flag, so the
+  // conservative domain nuke (flag OFF) still stands alongside it.
+  if (signals.hardBounceByAddress && (signals.hardBounceByAddress[candidate.email] || 0) >= 1) {
+    hardRejected = true; reasons.push('address_suppressed_hard_bounced');
   }
   if (_enrichmentFlag('ENRICHMENT_BOUNCE_V2')) {
     // Per-address: only the exact mailbox that hard-bounced is suppressed.

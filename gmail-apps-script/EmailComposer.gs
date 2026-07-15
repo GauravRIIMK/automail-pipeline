@@ -943,7 +943,7 @@ function _buildCompositionContext(lead, dossier, classification, resumeSelection
       company: 'upGrad',
       label: '2021-23',
       metrics: [
-        'Referral funnel 0 to Rs 15 Cr in 4 months',
+        'Referral funnel 0 to Rs 1.5 Cr in 4 months',
         '100+ career transitions via ABM + MarTech',
         'Cross-functional GTM: product, content, partnerships'
       ]
@@ -1194,7 +1194,7 @@ function _buildSystemPrompt(template, approach) {
     '\n' +
     'CORRECT EXAMPLES:\n' +
     '  {"label": "Blinkit Bistro (current)", "body": "P&L Ownership & Team Scale: Senior Manager owning station P&L across ~50 cloud kitchens in 4 cities. Resolved multi-city quality crisis; complaint rate cut by 94%. Coordinated ops, supply chain, and quality teams across 30+ stakeholders.", "showLorTag": false}\n' +
-    '  {"label": "upGrad (2021-23)", "body": "Category Growth & Stakeholder Mgmt: Growth Lead building referral funnels from 0 to Rs 15 Cr in 4 months. Drove 100+ career transitions via ABM + MarTech. Managed cross-functional GTM across product, content, and partnerships.", "showLorTag": false}\n' +
+    '  {"label": "upGrad (2021-23)", "body": "Category Growth & Stakeholder Mgmt: Growth Lead building referral funnels from 0 to Rs 1.5 Cr in 4 months. Drove 100+ career transitions via ABM + MarTech. Managed cross-functional GTM across product, content, and partnerships.", "showLorTag": false}\n' +
     '  {"label": "Great Learning (2019-20)", "body": "Scaling Through Partnerships: Built B2B partnership pipeline reaching 3 enterprise clients in first quarter. Revenue from partnerships contributed 20% of target. Maps directly to what you are scaling at [ORG].", "showLorTag": false}\n' +
     '\n' +
     '## STATIC BLOCKS (rendered automatically — do NOT regenerate in your JSON)\n' +
@@ -1249,7 +1249,33 @@ function _buildSystemPrompt(template, approach) {
     'Position Gaurav as a STRATEGY, MARKETING & GROWTH leader. Operations is supporting evidence only — NEVER in the subject line, NEVER the lead descriptor of his profile. ' +
     'Subject line AND body must target Strategy, Marketing, and Growth functions first. ' +
     'NEVER position for: pure operations/supply-chain roles, engineering, product management, data science, HR, finance. ' +
-    'If the lead\'s function is outside Growth/Marketing/Strategy, bridge to how Growth/Marketing/Strategy expertise serves THEIR org.\n';
+    'If the lead\'s function is outside Growth/Marketing/Strategy, bridge to how Growth/Marketing/Strategy expertise serves THEIR org.\n\n' +
+    // PATCH 2026-06-23 (identity-wall-standard): the STANDARD path lacked the identity
+    // wall the HR prompt has, so the composer MIRRORED the recipient's specialized
+    // function onto Gaurav (Suma "Campus & Alternate Channels" -> the whole email framed
+    // around "talent pipeline / talent acquisition", misrepresenting Gaurav as doing
+    // talent ops). This wall generalizes the HR guard to EVERY non-HR/non-CXO lead.
+    '## IDENTITY WALL (CRITICAL — THE RECIPIENT\'S FUNCTION NEVER BECOMES GAURAV\'S)\n' +
+    'The recipient\'s role facts describe THEM, not Gaurav. Gaurav\'s REAL domains are ONLY: strategy, ' +
+    'growth, marketing, quick-commerce operations (Blinkit Bistro), and ed-tech (upGrad / Great Learning). ' +
+    'He has ZERO experience in any specialized function outside those — e.g. talent acquisition / recruiting / ' +
+    'campus hiring / people-ops / HR, L&D, finance, legal, engineering, product management, data science, or ' +
+    'pure supply-chain.\n' +
+    '- NEVER attribute the recipient\'s specialized function to Gaurav and NEVER frame his relevance AS that ' +
+    'function. WRONG (the Suma failure): "expanding the talent pipeline... has been my operating reality"; ' +
+    '"campus and alternate channels become the front line for talent acquisition at scale". Gaurav does NOT do ' +
+    'talent acquisition, recruiting, or campus hiring.\n' +
+    '- Bridge ONLY via TRANSFERABLE skills (GTM, funnel velocity, channel partnerships, P&L, stakeholder ' +
+    'coordination, 0-to-1 builds) and how they SERVE the recipient\'s org — never claim Gaurav performs the ' +
+    'recipient\'s job.\n' +
+    '- Do NOT relabel an ambiguous recipient title into a specialized function it does not explicitly state. ' +
+    '"Campus & Alternate Channels" is a CHANNELS / GTM / distribution role unless the headline LITERALLY says ' +
+    'recruiting / talent / hiring — do not turn it into "talent acquisition" or "talent pipeline".\n' +
+    '- The "...has been my operating reality across N+ years in ed-tech and quick-commerce" clause describes ' +
+    'GAURAV\'s real domains — it must NEVER be bent to describe the recipient\'s function.\n' +
+    '- FORBIDDEN first-person attributions (any phrasing): talent acquisition, talent pipeline, recruiting, ' +
+    'sourcing, hiring pipeline, employer brand, people ops, HR — and any other function that is not ' +
+    'strategy / growth / marketing / quick-commerce-ops / ed-tech.\n';
 }
 
 // ─── ARCHETYPE SYSTEM PROMPTS (PATCH 2026-05-12) ────────────
@@ -1414,7 +1440,16 @@ function _buildCxoSystemPrompt(approach) {
     '- Plain ASCII only. No em-dashes (use " - " or hyphen). No smart quotes. No ellipsis characters.\n' +
     '- Humble tone: minimise "I" pronouns. Action verbs at sentence start where possible.\n' +
     '- Every claim has a number where one exists. Brand + number > adjective + adjective.\n' +
-    '- Tone: ' + (approach || 'executive brief, peer-to-peer, high signal density') + '\n';
+    '- Tone: ' + (approach || 'executive brief, peer-to-peer, high signal density') + '\n\n' +
+    // PATCH 2026-06-23 (identity-wall-cxo): same wall as STANDARD/HR — the recipient's
+    // specialized function never becomes Gaurav's (closes the cross-template mirroring root).
+    '## IDENTITY WALL (CRITICAL — RECIPIENT\'S FUNCTION NEVER BECOMES GAURAV\'S)\n' +
+    'Gaurav\'s REAL domains are ONLY strategy, growth, marketing, quick-commerce ops (Blinkit Bistro), and ' +
+    'ed-tech (upGrad / Great Learning). NEVER attribute the recipient\'s specialized function (e.g. talent ' +
+    'acquisition / recruiting / campus hiring / HR, finance, legal, engineering, product, data science, pure ' +
+    'supply-chain) to Gaurav or frame his relevance AS it. "Mapping to their org" means showing how his GTM / ' +
+    'growth / strategy / ops track record SERVES their org — never claiming he performs their job. Do not ' +
+    'relabel an ambiguous recipient title into a specialized function its headline does not state.\n';
 }
 
 // ─── ARCHETYPE USER PROMPTS (PATCH 2026-05-12) ────────────
@@ -1436,7 +1471,7 @@ function _buildHrUserPrompt(lead, context, classification, resumeSelection) {
     '  Industry: ' + (lead.industry || (classification && classification.industry) || '') + '\n\n' +
     'CANONICAL EXPERIENCE BANK (3 companies, dates, metrics — reframe category labels per HR template):\n' +
     '  - Blinkit Bistro (current): P&L across ~50 cloud kitchens, 4 cities; complaint rate -74%; 30+ cross-functional stakeholders\n' +
-    '  - upGrad (2021-23): Referral funnel 0 to Rs 15 Cr in 4 months; 14 cross-functional teams; 11 hybrid convocations 150%+ R2A\n' +
+    '  - upGrad (2021-23): Referral funnel 0 to Rs 1.5 Cr in 4 months; 14 cross-functional teams; 11 hybrid convocations 150%+ R2A\n' +
     '  - Great Learning (2019-20): B2B partnerships across 50+ nations; built the international vertical from zero; led university + enterprise channel partnerships end-to-end (NEVER use the word "youngest" anywhere — strictly forbidden)\n\n';
 
   // Inject available research signals
@@ -1480,7 +1515,7 @@ function _buildCxoUserPrompt(lead, context, classification, resumeSelection) {
     '  Industry: ' + industry + '\n' +
     '  Recent signals: ' + (context.dossierSummary || context.bestHookAngle || context.latestNews || 'unknown') + '\n\n' +
     'BRAND-ANCHORED CREDENTIAL BANK (pick the 2 outcomes that map BEST to ' + org + '\'s current problem; lead motivationParagraph with the recognisable brand + number):\n' +
-    '  - upGrad (2021-23): Built 0-to-1 referral funnel to Rs 15 Cr in 4 months; ~6% incremental monthly revenue; 14 cross-functional teams; 100+ career transitions via ABM + MarTech.\n' +
+    '  - upGrad (2021-23): Built 0-to-1 referral funnel to Rs 1.5 Cr in 4 months; ~6% incremental monthly revenue; 14 cross-functional teams; 100+ career transitions via ABM + MarTech.\n' +
     '  - Blinkit Bistro (current): Senior Manager P&L across ~50 cloud kitchens in 4 cities; complaint rate cut 94% across 121K orders; 30+ cross-functional stakeholders; 13 margin interventions.\n' +
     '  - Great Learning (2019-20): Built the international vertical from zero; B2B partnerships scaling across 50+ countries; led enterprise channel and university partnerships end-to-end. (NEVER use the word "youngest" — strictly forbidden.)\n' +
     '  - Builder/AI angle (use sparingly, only when relevant to the recipient): 3 AI tools shipped solo (LinkedIn Data Agent, Job Scraping Mailer, Scalar BDA CRM); GitHub.com/GauravRIIMK.\n\n' +
@@ -1498,7 +1533,7 @@ function _buildCxoUserPrompt(lead, context, classification, resumeSelection) {
     '  - "Tue or Thu next week — or happy to send a one-page memo on <topic>, whichever is easier."\n' +
     '  - "Worth 15 minutes? Or a one-page memo on <topic> if that is faster for you."\n\n' +
     'P.S. OPTIONS (pick ONE, 12-25 words, must be NUMERIC if possible, must NOT mention "youngest"):\n' +
-    '  - "Built upGrad\'s referral funnel from 0 to Rs 15 Cr in 4 months - same zero-to-one playbook for ' + org + '\'s <function>."\n' +
+    '  - "Built upGrad\'s referral funnel from 0 to Rs 1.5 Cr in 4 months - same zero-to-one playbook for ' + org + '\'s <function>."\n' +
     '  - "Ran ops for ~50 cloud kitchens at Blinkit Bistro across 4 cities and 30+ stakeholders without dedicated tooling."\n' +
     '  - "Scaled B2B partnerships across 50+ countries at Great Learning - operator who has shipped cross-border before."\n' +
     '  - "3 AI tools shipped solo this year (LinkedIn Data Agent, Job Scraping Mailer, Scalar BDA CRM) - building the partner-ops layer leaders ask about."\n\n' +
@@ -1625,8 +1660,8 @@ function _buildUserPrompt(template, lead, context, classification, resumeSelecti
     '  Verified metrics: ~50 cloud kitchens, 4 cities, P&L ownership, complaint rate cut 94%, 121K orders, 13 margin interventions, Rs 5.7L/month, 30+ cross-functional stakeholders, 35K-formula P&L workbook, 8-tab analytics dashboard.\n' +
     '  Sample body (angle = P&L & team scale): "P&L Ownership & Team Scale: Senior Manager owning station P&L across ~50 cloud kitchens in 4 cities. Resolved multi-city quality crisis - complaint rate cut by 94% across 121K orders in 2.5 weeks. Coordinated ops, supply chain, and quality across 30+ stakeholders."\n\n' +
     'EXPERIENCE 2: upGrad (2021-23)\n' +
-    '  Verified metrics: referral funnel 0 to Rs 15 Cr in 4 months, 100+ career transitions, ABM + MarTech, cross-functional GTM across product + content + partnerships.\n' +
-    '  Sample body (angle = category growth): "Category Growth & Stakeholder Mgmt: Growth Lead building referral funnels from 0 to Rs 15 Cr in 4 months. Drove 100+ career transitions via ABM + MarTech stack. Managed cross-functional GTM across product, content, and partnership teams."\n\n' +
+    '  Verified metrics: referral funnel 0 to Rs 1.5 Cr in 4 months, 100+ career transitions, ABM + MarTech, cross-functional GTM across product + content + partnerships.\n' +
+    '  Sample body (angle = category growth): "Category Growth & Stakeholder Mgmt: Growth Lead building referral funnels from 0 to Rs 1.5 Cr in 4 months. Drove 100+ career transitions via ABM + MarTech stack. Managed cross-functional GTM across product, content, and partnership teams."\n\n' +
     'EXPERIENCE 3: Great Learning (2019-20)\n' +
     '  Verified metrics: B2B partnership pipeline, enterprise clients, early-career scale-up, maps to org\'s partnership/channel needs.\n' +
     '  Sample body (angle = partnerships): "Scaling Through Partnerships: Built B2B partnership pipeline reaching enterprise clients in first quarter. Revenue from partnerships drove measurable contribution to target. Directly maps to channel-build priorities at ' + org + '."\n\n' +
@@ -2120,7 +2155,7 @@ function _normalizeParsedFields(parsed) {
       { label: 'Blinkit Bistro (current)',  anchor: /blinkit\s*bistro/i,
         fallback: 'Senior Manager P&L across ~50 cloud kitchens in 4 cities. Complaint rate cut 94% across 121K orders. 30+ cross-functional stakeholders, 13 margin interventions.' },
       { label: 'upGrad (2021-23)',          anchor: /upgrad/i,
-        fallback: 'Category Growth & Stakeholder Mgmt: Growth Lead building referral funnels from 0 to Rs 15 Cr in 4 months. Drove 100+ career transitions via ABM + MarTech. Managed cross-functional GTM across product, content, and partnerships.' },
+        fallback: 'Category Growth & Stakeholder Mgmt: Growth Lead building referral funnels from 0 to Rs 1.5 Cr in 4 months. Drove 100+ career transitions via ABM + MarTech. Managed cross-functional GTM across product, content, and partnerships.' },
       { label: 'Great Learning (2019-20)',  anchor: /great\s*learning/i,
         fallback: 'Scaling Through Partnerships: Built B2B partnership pipeline reaching 3 enterprise clients in first quarter. Revenue from partnerships contributed 20% of target.' }
     ];
@@ -2213,7 +2248,7 @@ function _normalizeParsedFields(parsed) {
         {
           label: 'upGrad (2021-23)',
           anchor: /upgrad/i,
-          fallback: 'Category Growth & Stakeholder Mgmt: Growth Lead building referral funnels from 0 to Rs 15 Cr in 4 months. Drove 100+ career transitions via ABM + MarTech. Managed cross-functional GTM across product, content, and partnerships.'
+          fallback: 'Category Growth & Stakeholder Mgmt: Growth Lead building referral funnels from 0 to Rs 1.5 Cr in 4 months. Drove 100+ career transitions via ABM + MarTech. Managed cross-functional GTM across product, content, and partnerships.'
         },
         {
           label: 'Great Learning (2019-20)',
@@ -2486,7 +2521,7 @@ function _composeDeterministicFallback(lead, dossier, classification, resumeSele
     },
     {
       label: 'upGrad (2021-23)',
-      body: 'Growth Lead building referral funnels from 0 to Rs 15 Cr in 4 months. '
+      body: 'Growth Lead building referral funnels from 0 to Rs 1.5 Cr in 4 months. '
           + 'Drove 100+ career transitions via ABM + MarTech stack, optimizing acquisition costs across channels. '
           + 'Managed cross-functional GTM across product, content, and partnership teams.',
       showLorTag: false
@@ -2711,7 +2746,7 @@ function _composeDeterministicFallback_CXO_SHORT(lead, dossier, classification, 
   } else {
     // Inline fallback (matches cxoVariant entries verbatim)
     cxoExpBullets = [
-      { label: 'upGrad',         body: 'Built referral funnel from 0 to ₹15 Cr in 4 months across 14 cross-functional teams.', showLorTag: false },
+      { label: 'upGrad',         body: 'Built referral funnel from 0 to ₹1.5 Cr in 4 months across 14 cross-functional teams.', showLorTag: false },
       { label: 'Blinkit Bistro', body: 'Ran P&L for ~50 cloud kitchens, 4 cities; cut complaint rate 94% across 121K orders.', showLorTag: false },
       { label: 'Great Learning', body: 'Scaled B2B partnerships across 50+ countries; built international vertical from zero.', showLorTag: false }
     ];
@@ -2845,7 +2880,7 @@ function _composeDeterministicFallback_CXO_SHORT(lead, dossier, classification, 
 //   P.S. — shared with cxoVariant (single strongest line)
 //   Multi-line signature (§6 — IIM-K is anchor)
 //
-// Subject: Pattern A "AI-native Growth & Strategy operator — ex-upGrad (₹15 Cr funnel) | Gaurav Rathore"
+// Subject: Pattern A "AI-native Growth & Strategy operator — ex-upGrad (₹1.5 Cr funnel) | Gaurav Rathore"
 //   Identity-led, 82 chars (mobile-safe). NO {{company_name}} substitution.
 //   NO "Job Application:" prefix.
 //
@@ -2890,7 +2925,7 @@ function _composeDeterministicFallback_HR(lead, dossier, classification, resumeS
 
   // 4 proof bullets, AI bullet LAST (Recruiter §4 Rule 1)
   var hrBullets = (hr.bullets && hr.bullets.length === 4) ? hr.bullets : [
-    'upGrad — built the 0-to-1 referral funnel to ₹15 Cr in 4 months.',
+    'upGrad — built the 0-to-1 referral funnel to ₹1.5 Cr in 4 months.',
     'Blinkit Bistro — ran ops for ~50 cloud kitchens across 4 cities, 30+ stakeholders.',
     'Great Learning — scaled B2B partnerships across 50+ countries; youngest department lead in the company\'s history.',
     'Shipped 3 production AI tools solo — automating sourcing, outreach and CRM end-to-end.'
@@ -2915,7 +2950,7 @@ function _composeDeterministicFallback_HR(lead, dossier, classification, resumeS
 
   // Subject — Pattern A (Recruiter §8), identity-led, 82 chars
   var rawSubject = (hr.subjectTemplate || '').toString() ||
-    'AI-native Growth & Strategy operator — ex-upGrad (₹15 Cr funnel) | Gaurav Rathore';
+    'AI-native Growth & Strategy operator — ex-upGrad (₹1.5 Cr funnel) | Gaurav Rathore';
 
   // Build subject — bypass _buildSubjectLine to avoid "Job Application:" prefix
   var finalSubject = rawSubject;

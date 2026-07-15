@@ -94,7 +94,10 @@ var VH_PROVIDER_COOLDOWNS_MS = {
 };
 
 // HTTP status code → state-transition intent
-var VH_QUOTA_ERROR_PATTERNS = /not enough credits|quota exhausted|quota exceeded|too many requests|monthly quota|billing cycle|payment required/i;
+// NOTE: "insufficient credits" is Apollo's exhaustion phrasing (HTTP 422) — added
+// 2026-06-30 after live data showed 695 consecutive Apollo 422s that only DEGRADED
+// (never OPENed) because the body didn't match, so exhausted Apollo was never skipped.
+var VH_QUOTA_ERROR_PATTERNS = /not enough credits|insufficient credits|quota exhausted|quota exceeded|too many requests|monthly quota|billing cycle|payment required/i;
 
 // ─── PUBLIC API ─────────────────────────────────────────────────────────────
 
@@ -381,4 +384,46 @@ function _vhLog(provider, event, detail) {
     try { _svc('Logger').log(msg); return; } catch (_) {}
   }
   Logger.log(msg);
+}
+
+// ─── ENRICHMENT-CASCADE FAILOVER WIRING (-p5-vendorfailover) ────────────────
+//
+// Thin, defensive adapters that the live enrichment call sites
+// (resolveLeadApolloMatch, _hunterEmailFinder, fetchHunterPattern) use to
+// participate in the breaker WITHOUT ever being able to break enrichment if
+// VendorHealth is mis-deployed or a property read throws.
+//
+// FAILOVER SEMANTICS (Apollo↔Hunter, user request 2026-06-30):
+//   • Apollo stays PREFERRED when healthy (accuracy 0.95 > Hunter 0.70) — the
+//     cascade tries it first; the breaker only SKIPS it when its circuit is
+//     OPEN (exhausted/auth-failed). A skipped Apollo makes resolveLeadApolloMatch
+//     return null, so enrichEmail falls through to Hunter, then pattern+Reoon.
+//   • Symmetric for Hunter: OPEN Hunter circuit → finder/pattern return null →
+//     cascade falls to the pattern engine. Whichever vendor is alive leads;
+//     when both recover, Apollo resumes primary automatically (30-min re-probe).
+//
+// KILL-SWITCH: ScriptProperty VENDOR_FAILOVER_ENABLED='0' makes
+// vendorFailoverShouldSkip ALWAYS return false (never skip) — i.e. revert to
+// the pre-wiring "always call the vendor" behavior, no redeploy needed.
+// Recording (vendorFailoverRecord) is harmless and is NOT gated: it only
+// updates breaker state, which is inert unless skipping is enabled.
+
+function vendorFailoverShouldSkip(provider) {
+  try {
+    var props = (typeof _svc === 'function') ? _svc('Properties') : PropertiesService.getScriptProperties();
+    if (props.getProperty('VENDOR_FAILOVER_ENABLED') === '0') return false;  // kill-switch
+    return (typeof vendorHealthShouldSkip === 'function') && vendorHealthShouldSkip(provider) === true;
+  } catch (e) {
+    return false;  // any failure → do NOT skip (fail safe = keep calling the vendor)
+  }
+}
+
+function vendorFailoverRecord(provider, httpCode, body) {
+  try {
+    if (typeof vendorHealthRecordResult === 'function') {
+      vendorHealthRecordResult(provider, httpCode, (body == null ? '' : body.toString()).substring(0, 300));
+    }
+  } catch (e) {
+    // Breaker bookkeeping must NEVER throw into the enrichment hot path.
+  }
 }

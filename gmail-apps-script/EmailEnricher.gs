@@ -100,9 +100,39 @@ var ORG_SUFFIX_NOISE = [
  *   domain: string
  * }
  */
+// ── DEMO MODE (2026-06-24) — SCOPED to the OWNER's OWN LinkedIn ONLY ─────────────
+// For live demos: scanning the owner's own profile yields a showcase result instead of a
+// real enrichment — a deliberately fake "the 3-layer engine found the most accurate email"
+// address. Fires ONLY for the exact owner slug below; every real lead is untouched. The
+// address is obviously non-deliverable and the pipeline only DRAFTS (never auto-sends), so
+// it cannot leak. To disable, blank _DEMO_SELF_SLUG.
+var _DEMO_SELF_SLUG = 'gaurav1-grow-learn-together';
+var _DEMO_SELF_EMAIL = 'most_accurate_mail_ID@3-layer-engine.com';  // domain MUST be a valid hostname (no underscores) or Gmail rejects the To header
+function _isDemoSelfProfile_(linkedinUrl) {
+  if (!_DEMO_SELF_SLUG) return false;
+  var m = (linkedinUrl || '').toString().toLowerCase().match(/\/in\/([^/?#]+)/);
+  return !!(m && m[1] === _DEMO_SELF_SLUG.toLowerCase());
+}
+
 function enrichEmail(lead) {
   if (!lead) {
     return { status: 'NEEDS_EMAIL', reason: 'no_lead_object', confidence: 0, candidates: [] };
+  }
+
+  // ── DEMO SELF-PROFILE SHORT-CIRCUIT (scoped to the owner slug only) ──
+  if (_isDemoSelfProfile_(lead.linkedinUrl)) {
+    lead.designation = 'Growth & GTM Ops';   // theme the composed draft for the demo
+    lead.isDemoSelf = true;                   // GmailDrafter suppresses the [VERIFY] prefix for a clean demo
+    Logger.log('[EmailEnricher] DEMO_SELF: owner profile detected — returning showcase email (scoped, drafts only).');
+    return {
+      status: 'VERIFIED',
+      email: _DEMO_SELF_EMAIL,
+      confidence: 0.99,
+      source: 'demo_3layer_engine',
+      classification: 'CORPORATE',
+      candidates: [],
+      reason: 'demo_self_profile'
+    };
   }
 
   // PATCH 2026-05-12: Normalize the LinkedIn URL first. Apollo /people/match
@@ -1612,6 +1642,44 @@ function _organizationToDomain(org) {
  * @param {string} email
  * @returns {Object} { status: string, raw?: Object }
  */
+/**
+ * REOON DISPOSABLE FALSE-POSITIVE allowlist (2026-07-07). Reoon sometimes labels a
+ * legitimate major corporate domain (CONFIRMED live: samsung.com) as 'disposable' —
+ * a domain-level mislabel that hard-rejects a real corporate email to conf 0.2. For
+ * domains we KNOW are not disposable, verifyEmailDeliverable downgrades that verdict to
+ * 'unknown' (mailbox-unprovable, same tier as a catch_all corporate → ~0.90 + [VERIFY])
+ * instead of tanking a correct address. Seed list below + live-extendable ScriptProperty
+ * REOON_DISPOSABLE_ALLOWLIST (comma-separated, no redeploy). Kill-switch
+ * REOON_DISPOSABLE_FP_GUARD_ENABLED='0'.
+ */
+function _reoonDisposableIsFalsePositive_(email) {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    // ★ 2026-07-07 DISABLED BY DEFAULT. Bounce ground-truth (user mailbox) showed samsung.com
+    // AND aexp.com pattern emails bounce ~100% ("550 address not found"). Overriding Reoon's
+    // negative verdict to 'unknown' (→0.90) made confidence LIE about undeliverable guesses —
+    // the accuracy ledger confirms `sheet_corporate_reoon_disputed` (Reoon-said-bad-kept-anyway)
+    // bounces 100%. Reoon's rejection was DIRECTIONALLY CORRECT; trust it. Guard fires ONLY if
+    // explicitly re-enabled ('1'). Domain being real ≠ the specific mailbox existing.
+    if (props.getProperty('REOON_DISPOSABLE_FP_GUARD_ENABLED') !== '1') return false;
+    var dom = ((email || '').toString().split('@')[1] || '').toLowerCase().trim();
+    if (!dom) return false;
+    var SEED = ['samsung.com','aexp.com','google.com','amazon.com','microsoft.com',
+                'apple.com','meta.com','oracle.com','ibm.com','intel.com','nvidia.com',
+                'deloitte.com','accenture.com','pwc.com','kpmg.com','ey.com','sony.com',
+                'flipkart.com','swiggy.in','zomato.com','paytm.com','razorpay.com',
+                'relianceretail.com','reliance.com','tcs.com','infosys.com','wipro.com',
+                'hcltech.com','adobe.com','salesforce.com','uber.com','snowflake.com','g2.com'];
+    if (SEED.indexOf(dom) !== -1) return true;
+    var extra = (props.getProperty('REOON_DISPOSABLE_ALLOWLIST') || '').toLowerCase();
+    if (extra) {
+      var list = extra.split(',');
+      for (var i = 0; i < list.length; i++) { if (list[i].trim() === dom) return true; }
+    }
+    return false;
+  } catch (_e) { return false; }
+}
+
 function verifyEmailDeliverable(email) {
   if (!email) return { status: 'invalid', reason: 'empty' };
   var addr = email.toString().trim().toLowerCase();
@@ -1678,7 +1746,9 @@ function verifyEmailDeliverable(email) {
       var transient = (parsed.status === 'unknown' || parsed.status === 'skipped');
       var ttlHours = transient ? 6 : (30 * 24);
       if (ageHours < ttlHours) {
-        return { status: parsed.status, raw: parsed.raw, cached: true,
+        var _cachedStatus = parsed.status;
+        if (_cachedStatus === 'disposable' && _reoonDisposableIsFalsePositive_(addr)) _cachedStatus = 'unknown';
+        return { status: _cachedStatus, raw: parsed.raw, cached: true,
                  ageHours: ageHours.toFixed(1), ttlPolicy: transient ? 'short_6h' : 'long_30d' };
       }
     }
@@ -1727,6 +1797,13 @@ function verifyEmailDeliverable(email) {
         var raw = null;
         try { raw = JSON.parse(bodyText); } catch (_) {}
         var status = (raw && (raw.status || '').toString().toLowerCase()) || 'unknown';
+        // REOON DISPOSABLE FALSE-POSITIVE guard: samsung.com (and other known-legit
+        // corporate domains) get mislabeled 'disposable' → downgrade to 'unknown' so a
+        // real corporate email drafts at the corporate ceiling + [VERIFY] instead of 0.2.
+        if (status === 'disposable' && _reoonDisposableIsFalsePositive_(addr)) {
+          Logger.log('[Reoon] disposable FALSE-POSITIVE on known-legit domain (' + addr + ') → unknown');
+          status = 'unknown';
+        }
         Logger.log('[EmailEnricher] Reoon ' + mode + ' OK for ' + addr + ': ' + status);
 
         // Track Quick-mode usage against daily quota
@@ -1990,6 +2067,14 @@ function _hunterEmailFinder(domain, firstName, lastName) {
     }
   } catch (_) { /* cache optional */ }
 
+  // ── VENDOR FAILOVER (-p5-vendorfailover): skip a known-exhausted Hunter so
+  // the cascade falls through to the pattern+Reoon engine instead of burning a
+  // round-trip on a dead vendor. Kill-switch: VENDOR_FAILOVER_ENABLED='0'. ──
+  if (typeof vendorFailoverShouldSkip === 'function' && vendorFailoverShouldSkip('hunter')) {
+    Logger.log('[EmailEnricher] hunter circuit OPEN — skipping finder; cascade falls through to pattern');
+    return null;
+  }
+
   // ── Live API call ──
   var url = 'https://api.hunter.io/v2/email-finder' +
     '?domain=' + encodeURIComponent(domain) +
@@ -2000,6 +2085,11 @@ function _hunterEmailFinder(domain, firstName, lastName) {
   try {
     var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
     var code = res.getResponseCode();
+    if (typeof vendorFailoverRecord === 'function') {
+      var _hfBody = '';
+      try { _hfBody = res.getContentText(); } catch (_) {}
+      vendorFailoverRecord('hunter', code, _hfBody);
+    }
     if (code === 429) {
       Logger.log('[EmailEnricher] Hunter rate-limited (429) — free tier exhausted this month');
       return null;
@@ -2142,6 +2232,11 @@ function _resolveManualDomainOverride(orgName) {
   var MANUAL_DOMAIN_OVERRIDES = {
     nothing:       'nothing.tech',     // Carl Pei's consumer electronics co
     oneplus:       'oneplus.com',
+    // 2026-07-07: American Express employees use @aexp.com (AEXP ticker), NOT the
+    // consumer site americanexpress.com. Without this the constructor slugs to
+    // americanexpress.com -> Reoon INVALID -> wrong low-confidence email.
+    americanexpress: 'aexp.com',
+    amex:            'aexp.com',
     razorpay:      'razorpay.com',
     cred:          'cred.club',
     notion:        'makenotion.com',   // notion.so is the product domain; email is makenotion.com

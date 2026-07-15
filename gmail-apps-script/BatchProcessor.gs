@@ -220,7 +220,19 @@ function _recoverIdentityFromUrl(lead) {
           out.lastName = apolloMatch.lastName ||
                          (apolloMatch.fullName.split(' ').slice(1).join(' '));
         }
-        if (apolloMatch.organizationName) out.organization = apolloMatch.organizationName;
+        if (apolloMatch.organizationName) {
+          // ORG ARBITRATION (2026-06-24): even on the identity-recovery path, route Apollo's
+          // org through the domain-echo guard. out.organization is freshly '' here, so this is
+          // the blank-Vision fill path — a getstan.app→"STAN" echo is suppressed to '' (→ review)
+          // instead of being recovered as a wrong employer. Apollo-sourced fills raise
+          // lead.orgArbVerify so the [VERIFY] subject prefix engages downstream.
+          var _riArb = _resolveOrgFromSignals('', apolloMatch.organizationName,
+            apolloMatch.domain, (lead.email || ''), apolloMatch.email);
+          if (_riArb.org) {
+            out.organization = _riArb.org;
+            if (_riArb.flag === 'apollo_sourced_verify' && lead) lead.orgArbVerify = true;
+          }
+        }
         if (apolloMatch.title) out.designation = apolloMatch.title;
         if (out.fullName || out.organization) {
           out.source = 'apollo_people_match';
@@ -369,7 +381,7 @@ function _synthesizeMinimalEmail(lead, classification) {
     '<p>Hi ' + first + ',</p>' +
     '<p>Brief note: I have been following work at ' + org +
     ' and wanted to reach out. With 4.5+ years across ed-tech and quick-commerce - ' +
-    'including 0-to-1 referral funnel scaling at upGrad (Rs 15 Cr in 4 months) and ' +
+    'including 0-to-1 referral funnel scaling at upGrad (Rs 1.5 Cr in 4 months) and ' +
     'station P&L across ~50 cloud kitchens at Blinkit Bistro - I think there may be ' +
     'a useful overlap with what your team is building.</p>' +
     '<p>Would 15 minutes work to compare notes?</p>' +
@@ -571,14 +583,45 @@ function _recompFormatGuard(originalHtml, candidateHtml) {
 // ScriptProperty EMPLOYER_RECONCILE_ENABLED=0.
 
 function _employerReconcileEnabled_() {
+  // HARD-RETIRED 2026-06-24 — the headline→organization OVERRIDE is removed ENTIRELY.
+  // Previously this defaulted fail-open ON and was only suppressed by a ScriptProperty
+  // (EMPLOYER_RECONCILE_ENABLED=0) — a silent-rollback landmine: clearing the property
+  // resurrected the wrong-org override. The headline parser proved unreliable (mis-read
+  // taglines / "ex-" segments / advisory "at" phrases → overwrote correct orgs: Bhavya
+  // "Bistro", the "STAN" class). Org now comes ONLY from the Experience-"Present" read +
+  // the human ORG_OVERRIDE. Returns false UNCONDITIONALLY so the override can never run,
+  // regardless of any ScriptProperty. (The pure extractors below are retained + unit-
+  // tested for safety, but are never consumed by the pipeline.)
+  return false;
+}
+
+// PATCH 2026-06-17-verify-email-hold (Feature 1): when ON, an UNVERIFIED low-
+// confidence guessed email (finalizer risk flag 'verify_recipient_before_send')
+// is parked at STATUS=VERIFY_EMAIL instead of being auto-composed into a sendable
+// draft — so a guess can't go out until the user verifies + promotes it
+// (menuPromoteEmailVerify). Default ON; kill-switch ScriptProperty
+// EMAIL_VERIFY_HOLD_ENABLED=0. Rationale (the Sambhaw lesson): a verification
+// check is nearly free; a wrong/guessed send to a high-value contact is not.
+function _verifyEmailHoldEnabled_() {
   try {
-    return PropertiesService.getScriptProperties().getProperty('EMPLOYER_RECONCILE_ENABLED') !== '0';
+    return PropertiesService.getScriptProperties().getProperty('EMAIL_VERIFY_HOLD_ENABLED') !== '0';
   } catch (_) { return true; }  // default ON; fail-open
 }
 
 // Pure: extract a high-confidence CURRENT company from a LinkedIn headline, or ''.
 function _extractHeadlineCurrentCompany(headline) {
   var h = (headline || '').toString().trim();
+  if (!h) return '';
+  // PATCH 2026-06-19-headline-exseg (KEYSTONE): drop past-role SEGMENTS before extraction so a
+  // company named only inside an "Ex …" / "previously …" segment is NOT mistaken for the current
+  // employer. Bhavya's "Flipkart | Ex Product @Bistro, Analytics @ Blinkit" used to return "Bistro"
+  // (the @-branch grabbed the first @company, ignoring the "Ex") → _reconcileCurrentEmployer then
+  // OVERWROTE the correct org "Flipkart" → both the email domain (bistro.sk) and the letter ("for
+  // Bistro") went wrong. Returning '' here (vs the ex-company) leaves the correct org untouched.
+  // Strictly safer: it only ever returns '' where it previously returned an ex-employer.
+  var _EXSEG = /\b(ex[-\s]|formerly|former|previously|previous|prev|past)\b/i;
+  var _cur = h.split(/[|•]/).filter(function(s) { return !_EXSEG.test(s); }).join(' | ').trim();
+  h = _cur;
   if (!h) return '';
   var STOP = { 'scale':1,'heart':1,'home':1,'work':1,'large':1,'once':1,'last':1,
                'least':1,'best':1,'all':1,'speed':1,'hand':1,'times':1,'present':1,
@@ -627,6 +670,120 @@ function _companiesConflict(headlineCo, org) {
   var at = {}; a.split(' ').forEach(function(t){ if (t.length >= 4) at[t] = 1; });
   var shared = b.split(' ').some(function(t){ return t.length >= 4 && at[t]; });
   return !shared;                                              // no shared significant token → conflict
+}
+
+// ─── ORG "LOGICAL WINNER" ARBITRATION (2026-06-24-org-arbitration) ──────────────
+// Picks the best current-employer org between the Gemini-Vision Experience-"Present"
+// read (lead.organization, may be blank) and Apollo's org-of-record — MAXIMIZING
+// correct fills while making the S.Roy domain-echo bug STRUCTURALLY unreachable.
+// Adversarially verified (3-design panel + 9-fixture stress, 9/9 pass). Pure; the only
+// externals are _normCompanyName / _looksLikeNonCompanyOrg / _orgDomainGateRejects (all
+// typeof-guarded). Canonical table:
+//   R1 both blank            → '',                        needs_review
+//   R2 vision only           → vision (junk → '', needs_review)
+//   R3 apollo-only echo/junk  → '',                        needs_review   ← THE S.ROY GATE
+//   R4/R5 apollo-only safe    → apollo_fallback,           apollo_sourced_verify ([VERIFY])
+//   R6 both agree            → vision (+apollo_corroborated), no flag
+//   R7 both disagree         → vision,                     org_disagreement ([VERIFY]); alt=apollo
+//                              (rare sub-case: vision is a tagline + apollo is clean + an
+//                               INDEPENDENT non-Apollo email corroborates → apollo_fallback)
+// The domain-echo guard runs ONLY on the blank-Vision FILL path (R3); it NEVER blanks a
+// Vision-read org (R2/R6/R7) — corroboration only raises confidence (HARD CONSTRAINT 3).
+// An email == apolloMatch.email is SELF-corroboration (same primary_domain Apollo derived
+// the org from) → ZERO independent evidence — it can never relax the echo gate or a tie.
+
+// Registrable label of a domain (the segment left of the public suffix), alnum-lowered.
+function _orgArbRegistrableLabel_(domain) {
+  var d = String(domain || '').toLowerCase().trim()
+    .replace(/^https?:\/\//, '').replace(/^www\./, '');
+  var slash = d.indexOf('/'); if (slash >= 0) d = d.substring(0, slash);
+  var parts = d.split('.').filter(Boolean);
+  if (parts.length < 2) return (parts[0] || '').replace(/[^a-z0-9]+/g, '');
+  var MULTI = { 'co.uk':1,'com.au':1,'co.in':1,'org.uk':1,'co.nz':1,'com.br':1,'ac.in':1,'co.za':1,'org.in':1 };
+  var lastTwo = parts.slice(-2).join('.');
+  var idx = MULTI[lastTwo] ? parts.length - 3 : parts.length - 2;
+  if (idx < 0) idx = 0;
+  return (parts[idx] || '').replace(/[^a-z0-9]+/g, '');
+}
+
+// Is Apollo's org just its own DOMAIN BRAND padded with vanity glue (getstan ⊃ stan)?
+// DIRECTIONAL (label-wraps-org ONLY): Apollo reverse-derives organization_name from
+// primary_domain, so a vanity/outreach domain whose label CONTAINS the org token with
+// extra prefix/suffix glue is the manufactured-wrong-org fingerprint (the S.Roy trap).
+//  • org === label  → NOT echo, ALLOWED (normal employee: work-email domain == employer).
+//  • label ⊃ org    → ECHO (getstan⊃stan, thefoo⊃foo, joinbar⊃bar).
+//  • org ⊃ label    → NOT echo (a real, longer company name is not a vanity echo).
+//  • un-derivable / org<3 chars → NOT echo (R5 still fills, but with the [VERIFY] flag).
+// leadEmail is deliberately NOT an input — an email on the same domain is self-
+// corroboration, never independent evidence, and must never relax this gate.
+function _isApolloOrgDomainEcho_(apolloOrg, apolloDomain) {
+  var label = _orgArbRegistrableLabel_(apolloDomain);
+  var org = ((typeof _normCompanyName === 'function') ? _normCompanyName(apolloOrg) : String(apolloOrg || '').toLowerCase())
+            .replace(/[^a-z0-9]+/g, '');
+  if (!org || !label) return false;          // un-derivable → not echo (fill + [VERIFY])
+  if (org === label) return false;           // exact → normal employee, ALLOWED
+  if (org.length < 3) return false;          // too weak to call an echo → fill + [VERIFY]
+  return label !== org && label.indexOf(org) >= 0;   // label wraps org → vanity echo
+}
+
+// Do a Vision org and an Apollo org name the same employer? (normalized; self-contained)
+function _orgArbOrgsAgree_(nv, na) {
+  if (!nv || !na) return false;
+  if (nv === na) return true;
+  if (nv.indexOf(na) >= 0 || na.indexOf(nv) >= 0) return true;   // containment
+  var av = nv.split(/\s+/).filter(function(t){ return t.length >= 4; });
+  var aa = na.split(/\s+/).filter(function(t){ return t.length >= 4; });
+  for (var i = 0; i < av.length; i++) { if (aa.indexOf(av[i]) >= 0) return true; }  // shared 4+ token
+  return false;
+}
+
+// THE ARBITER. Returns { org, source, flag, alternate }. Pure.
+// flag ∈ { '', 'needs_review', 'apollo_sourced_verify', 'org_disagreement' }.
+function _resolveOrgFromSignals(visionOrg, apolloOrg, apolloDomain, leadEmail, apolloEmail) {
+  var v = String(visionOrg || '').trim();
+  var a = String(apolloOrg  || '').trim();
+  var nv = (typeof _normCompanyName === 'function') ? _normCompanyName(v) : v.toLowerCase();
+  var na = (typeof _normCompanyName === 'function') ? _normCompanyName(a) : a.toLowerCase();
+  var apolloJunk = (a && typeof _looksLikeNonCompanyOrg === 'function') ? _looksLikeNonCompanyOrg(a) : false;
+  var visionJunk = (v && typeof _looksLikeNonCompanyOrg === 'function') ? _looksLikeNonCompanyOrg(v) : false;
+  var emailIsApolloOwn = !!(leadEmail && apolloEmail &&
+    String(leadEmail).toLowerCase() === String(apolloEmail).toLowerCase());
+  var independentCorrob = !!(leadEmail && !emailIsApolloOwn && a &&
+    typeof _orgDomainGateRejects === 'function' && !_orgDomainGateRejects(a, leadEmail, null));
+
+  if (!v && !a) return { org: '', source: '', flag: 'needs_review', alternate: '' };           // R1
+  if (v && !a) {                                                                                 // R2
+    if (visionJunk) return { org: '', source: '', flag: 'needs_review', alternate: '' };
+    return { org: v, source: 'vision', flag: '', alternate: '' };
+  }
+  if (!v && a) {                                                                                 // R3..R5
+    if (apolloJunk || _isApolloOrgDomainEcho_(a, apolloDomain))
+      return { org: '', source: '', flag: 'needs_review', alternate: a };                       // R3 S.Roy gate
+    return { org: a, source: 'apollo_fallback', flag: 'apollo_sourced_verify', alternate: '' };  // R4/R5
+  }
+  if (_orgArbOrgsAgree_(nv, na))                                                                  // R6 (echo NOT consulted)
+    return { org: v, source: 'vision+apollo_corroborated', flag: '', alternate: a };
+  if (visionJunk && !apolloJunk && independentCorrob)                                             // R7 rare: vision misread a tagline
+    return { org: a, source: 'apollo_fallback', flag: 'apollo_sourced_verify', alternate: v };
+  return { org: v, source: 'vision', flag: 'org_disagreement', alternate: a };                   // R7 disagree (Vision wins)
+}
+
+// Apply the arbiter to a lead in-place: set lead.organization to the winner and, when the
+// verdict is uncertain (apollo-sourced or a Vision↔Apollo conflict), raise lead.orgArbVerify
+// so GmailDrafter prepends the non-deletable [VERIFY] subject prefix (the human is the final
+// gate; nothing is parked). Returns the arbiter verdict for logging/NOTES.
+function _applyOrgArbitration_(lead, apolloOrg, apolloDomain, apolloEmail) {
+  var arb = _resolveOrgFromSignals(
+    (lead && lead.organization) || '', apolloOrg, apolloDomain,
+    (lead && lead.email) || '', apolloEmail || '');
+  if (arb.org && arb.org !== lead.organization) lead.organization = arb.org;
+  if (arb.flag === 'apollo_sourced_verify' || arb.flag === 'org_disagreement') {
+    lead.orgArbVerify = true;
+    var tag = (arb.flag === 'org_disagreement') ? 'ORG_DISAGREEMENT' : 'ORG_APOLLO_FALLBACK';
+    lead.notes = ((lead.notes || '') + ' [' + tag + ']' +
+      (arb.alternate ? ' alt="' + arb.alternate + '"' : '')).trim();
+  }
+  return arb;
 }
 
 // Mutates lead.organization / lead.designation / lead.email on a confident conflict.
@@ -701,6 +858,22 @@ function _processOneLead(lead) {
   }
   // ── END SHEET-TRUTH HYDRATION ─────────────────────────────────────────────
 
+  // ── HUMAN-VERIFIED ORG OVERRIDE (2026-06-19-org-override) — HIGHEST AUTHORITY ──
+  // A person confirmed the current employer (menuFixEmployerAndPromote). Applied BEFORE
+  // email-finding + composition so BOTH the email domain AND the letter target the right
+  // company. Unlike _reconcileCurrentEmployer (headline-parsed, now disabled under trust-org),
+  // this is human truth → ALWAYS applied, regardless of the reconcile flag.
+  try {
+    var _ovOrg = (typeof _orgOverrideGet_ === 'function') ? _orgOverrideGet_(lead.rowNum) : '';
+    if (_ovOrg && _ovOrg !== lead.organization) {
+      Logger.log('[BatchProcessor] ORG_OVERRIDE row=' + (lead.rowNum || '?') +
+                 ' "' + (lead.organization || '') + '"→"' + _ovOrg + '"');
+      lead.notes = ((lead.notes || '') + ' [ORG_VERIFIED] ' + (lead.organization || '') + '→' + _ovOrg).trim();
+      lead.designation = '';           // stale designation belonged to the prior org
+      lead.organization = _ovOrg;
+    }
+  } catch (_ovErr) { Logger.log('[BatchProcessor] ORG_OVERRIDE failed (non-fatal): ' + _ovErr.message); }
+
   // ── EMPLOYER RECONCILIATION (2026-06-17-employer-reconcile) ───────────────
   // Correct a stale current-employer mismatch (headline = current truth) BEFORE
   // email-finding / org-gate / composition consume lead.organization. Fixes the
@@ -725,6 +898,33 @@ function _processOneLead(lead) {
       Logger.log('[BatchProcessor] EMPLOYER_RECONCILE failed (non-fatal): ' + _empErr.message);
     }
   }
+
+  // ── NON-COMPANY ORG GUARD (2026-06-22, RCA wrong-org headline-derived) ─────
+  // Mirror of the server intake guard _looksLikeNonCompanyOrg, applied on the
+  // RE-PROCESS path too (a reset of an existing pre-v1.0.15 lead whose org is a
+  // headline tagline / program / education institution). BLANK the org IN-MEMORY
+  // (not a hard park) so the email engine cannot derive a junk domain from it,
+  // while Apollo — which matches by LinkedIn URL, org-independent — can still find
+  // a real email. If nothing resolves, the lead parks at NEEDS_EMAIL naturally. A
+  // human ORG_OVERRIDE above already won (it ran first), so a confirmed org is
+  // never blanked. We do NOT write the org back (Sheet2 col is a UNIQUE spill).
+  try {
+    if (typeof _looksLikeNonCompanyOrg === 'function' &&
+        lead.organization && _looksLikeNonCompanyOrg(lead.organization)) {
+      Logger.log('[BatchProcessor] NON_COMPANY_ORG row=' + (lead.rowNum || '?') +
+                 ' org="' + lead.organization + '" — blanked (not a company); URL-based enrichment continues');
+      lead.notes = ((lead.notes || '') + ' [NON_COMPANY_ORG] blanked "' + lead.organization + '"').trim();
+      lead.organization = '';
+    }
+  } catch (_ncoErr) {
+    Logger.log('[BatchProcessor] NON_COMPANY_ORG check failed (non-fatal): ' + _ncoErr.message);
+  }
+
+  // PATCH 2026-06-17-verify-email-hold: capture the user-promotion marker from the
+  // hydrated notes BEFORE any _uf NOTES write, so a lead the user already promoted
+  // (menuPromoteEmailVerify) bypasses the low-confidence hold gate below instead of
+  // looping held→promote→held. Deterministic guesses re-guess the same address.
+  var _emailVerifiedByUser = String((lead && lead.notes) || '').indexOf('[EMAIL_VERIFIED_BY_USER]') >= 0;
 
   // ── PATCH `-p5-latency-instrument` (Phase 2a): per-stage timers ──
   // Zero behavior change. Emits [LATENCY row=N stage=NAME ms=X] per stage.
@@ -1011,9 +1211,21 @@ function _processOneLead(lead) {
     // classify → compose → draft. A NOTES annotation records the recovery.
     if (enrichment.apolloMatch) {
       var recoveredFields = [];
-      if (!lead.organization && enrichment.apolloMatch.organizationName) {
-        lead.organization = enrichment.apolloMatch.organizationName;
-        recoveredFields.push('organization=' + lead.organization);
+      // ORG ARBITRATION (2026-06-24-org-arbitration): pick the logical winner between the
+      // Vision org (lead.organization, may be blank) and Apollo's org-of-record, GUARDED
+      // against the S.Roy domain-echo trap. Replaces the old blind
+      // `if (!lead.organization) lead.organization = apolloMatch.organizationName` — which
+      // re-introduced the wrong-org bug server-side (Apollo "STAN" from getstan.app). Also
+      // hardens the present-Vision path: a Vision↔Apollo conflict now raises [VERIFY] for a
+      // human glance instead of silently overriding (Constraint 1) — this is the "incorrect"
+      // case the user asked to catch. See _resolveOrgFromSignals.
+      if (enrichment.apolloMatch.organizationName || lead.organization) {
+        var _preOrg = lead.organization || '';
+        var _orgArb = _applyOrgArbitration_(lead, enrichment.apolloMatch.organizationName,
+          enrichment.apolloMatch.domain, enrichment.apolloMatch.email);
+        if (lead.organization && lead.organization !== _preOrg) {
+          recoveredFields.push('organization=' + lead.organization + '[' + _orgArb.source + ']');
+        }
       }
       if (!lead.designation && enrichment.apolloMatch.title) {
         lead.designation = enrichment.apolloMatch.title;
@@ -1133,10 +1345,15 @@ function _processOneLead(lead) {
       var finalized = finalizeEmailSelection(lead, enrichment);
       // finalizeEmailSelection already mutated lead.email + lead.emailConfidence
       // + lead.selectionTier + lead.riskFlags. Persist to sheet.
+      // PATCH 2026-06-23 (instrumentation): persist the chosen email's Reoon verdict in
+      // the FINALIZER note so a future bounce cycle can bucket bounce-rate BY VERDICT
+      // (catch_all vs safe) — the calibration gap the 2026-06-23 baseline could not measure.
+      var _winnerReoon = ((enrichment && enrichment.reoonStatus) || 'n/a');
       var finalizerNotes = 'FINALIZER tier=' + finalized.tier +
                            ' conf=' + finalized.confidence.toFixed(2) +
                            ' email=' + finalized.email +
                            ' source=' + finalized.source +
+                           ' reoon=' + _winnerReoon +
                            ' reasoning=' + finalized.reasoning;
       if (finalized.riskFlags && finalized.riskFlags.length > 0) {
         finalizerNotes += ' | risks=[' + finalized.riskFlags.join(',') + ']';
@@ -1152,6 +1369,66 @@ function _processOneLead(lead) {
       } catch (writeErr) {
         Logger.log('[BatchProcessor] Finalizer-result write failed: ' + writeErr.message);
       }
+      // PATCH 2026-06-23 (instrumentation): emit an append-only PROVENANCE event so a
+      // FUTURE bounce cycle can compute precision-by-confidence-band, bounce-rate-by-
+      // reoon-verdict, AND candidate-RECALL (was the true address even generated?) — the
+      // calibration data the baseline could not measure (no per-lead candidate set was
+      // persisted). Captures the selector winner's verdict + full candidate set + runner-up.
+      // Append-only (survives the syncer NOTES rewrites that lost 17/58 bounces' provenance).
+      // Never throws. Analysis tool (join to bounces) runs next cycle once data accrues.
+      try {
+        var _provCands = ((enrichment && enrichment.candidates) || []).slice(0, 5).join(';');
+        var _provRU = (enrichment && enrichment.runnerUps && enrichment.runnerUps[0])
+          ? (enrichment.runnerUps[0].email + '|' + enrichment.runnerUps[0].score) : 'none';
+        logPipelineEvent(lead.rowNum, 'PROVENANCE',
+          'email=' + finalized.email + ' conf=' + finalized.confidence.toFixed(2) +
+          ' tier=' + finalized.tier + ' source=' + finalized.source +
+          ' reoon=' + _winnerReoon +
+          ' domain=' + (lead.resolvedDomain || '') + ' org=' + (lead.organization || '') +
+          ' diversity=' + ((enrichment && enrichment.diversity) || '') +
+          ' candidates=[' + _provCands + '] runnerUp=' + _provRU, 'INFO');
+      } catch (_provErr) {}
+
+      // PATCH 2026-06-23 (operator candidate email): the operator supplied a TENTATIVE
+      // address via menuSetCandidateEmail (likely-but-unconfirmed — e.g. Vedang, whose
+      // real mailbox no source has). Use it as the recipient BUT keep it UNVERIFIED +
+      // [VERIFY]-flagged so it drafts for review and NEVER auto-/blind-sends as "verified".
+      // Distinct from the durable EMAIL_LOCK (user_verified, clean). Applied HERE
+      // (post-finalize, pre-gates) so it pre-empts the org-domain gate, the
+      // NEEDS_EMAIL_REVIEW abort, AND the constructed-tier park. Clear: menuSetCandidateEmail(row,'').
+      try {
+        var _candEmail = (typeof _candidateEmailGet_ === 'function') ? _candidateEmailGet_(lead.rowNum) : '';
+        if (_candEmail && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(_candEmail)) {
+          lead.email = _candEmail;
+          finalized.email = _candEmail;
+          finalized.orgDomainGateBlocked = false;     // do not abort — operator chose this address
+          finalized.status = 'VERIFIED';              // proceed past the NEEDS_EMAIL_REVIEW abort (NOT a real verification)
+          finalized.tier = 'low_confidence';          // NOT 'verified' (Phase A won't suppress the flag) and NOT 'constructed' (park won't fire)
+          finalized.confidence = Math.min((typeof finalized.confidence === 'number' ? finalized.confidence : 0.5), 0.50);
+          finalized.source = 'operator_candidate';
+          finalized.riskFlags = finalized.riskFlags || [];
+          if (finalized.riskFlags.indexOf('verify_recipient_before_send') < 0) finalized.riskFlags.push('verify_recipient_before_send');
+          lead.riskFlags = lead.riskFlags || [];
+          if (lead.riskFlags.indexOf('verify_recipient_before_send') < 0) lead.riskFlags.push('verify_recipient_before_send');
+          lead.emailConfidence = finalized.confidence;
+          lead.selectionTier = 'low_confidence';
+          logPipelineEvent(lead.rowNum, 'ENRICH',
+            '[OPERATOR_CANDIDATE] using tentative operator-supplied ' + _candEmail +
+            ' — kept UNVERIFIED + [VERIFY] (never blind-sent; not deliverability-checked)', 'WARN');
+          try {
+            _uf(lead, {
+              ENRICHED_EMAIL:   _candEmail,
+              EMAIL_SOURCE:     'operator_candidate',
+              EMAIL_CONFIDENCE: finalized.confidence.toFixed(2),
+              NOTES: '[OPERATOR_CANDIDATE conf=' + Math.round(finalized.confidence * 100) +
+                '%] tentative operator email ' + _candEmail + ' — VERIFY recipient before sending (not deliverability-verified).'
+            });
+          } catch (_) {}
+        }
+      } catch (_candErr) {
+        Logger.log('[BatchProcessor] operator-candidate apply failed (non-blocking): ' + _candErr.message);
+      }
+
       // ORG_DOMAIN_GATE (2026-06-12-org-domain-gate): when all candidates were
       // rejected by the org-domain consistency gate, the finalizer returns
       // status='NEEDS_EMAIL_REVIEW'. Abort this lead's pipeline run and write
@@ -1207,6 +1484,101 @@ function _processOneLead(lead) {
         return;  // abort pipeline for this row — lead.email is empty, no draft possible
       }
 
+      // PATCH 2026-06-17-verify-email-hold (Feature 1): the finalizer found an
+      // email but flagged it 'verify_recipient_before_send' — i.e. an UNVERIFIED
+      // guess (tier low_confidence / best_of_available / constructed). Sending a
+      // guess risks a bounce or a wrong-company hit to a high-value contact. Park
+      // it at VERIFY_EMAIL (no compose → also saves Claude tokens) so a human
+      // verifies the address and promotes it (menuPromoteEmailVerify), unless the
+      // user already did (the [EMAIL_VERIFIED_BY_USER] marker bypasses this).
+      // PATCH 2026-06-22-no-hold (user directive + research-verified "Quarantine pattern":
+      // best-effort output + flag, never block throughput). A low-confidence guess used to be
+      // PARKED at VERIFY_EMAIL (no draft) — which stranded leads. Now we PROCEED to draft the
+      // best-available address and FLAG it (low EMAIL_CONFIDENCE + a [LOW_CONFIDENCE_DRAFT] note)
+      // so the human reviews it before the manual send — the human is already the review gate in
+      // a draft-then-send model (research open-Q4). Reversible escape hatch: set ScriptProperty
+      // EMAIL_VERIFY_HARD_HOLD='1' to restore the old park-and-hold for these guesses.
+      if (finalized.riskFlags && finalized.riskFlags.indexOf('verify_recipient_before_send') >= 0 &&
+          !_emailVerifiedByUser) {
+        var _vhConf = Math.round((finalized.confidence || 0) * 100);
+        // PATCH 2026-06-23 (constructed-tier park): a 'constructed' email is a PURE
+        // FABRICATED pattern guess (conf ~0.20) with NO captured email and NO provider
+        // hit — the engine literally invented a plausible local-part at the resolved
+        // domain. Sending it is a coin-flip that BOUNCES on any non-catch-all domain
+        // (Vedang: vedang.tarare@scalerailabs.com -> 550, Google Workspace). A bounce is
+        // pure downside (sender reputation), so — UNLIKE a real-but-unverified candidate
+        // (low_confidence / best_of_available, which keep drafting+flagging under no-hold)
+        // — this tier bounces on non-catch-all domains, so parking it avoids wasted bounces.
+        // ★2026-06-24 (user decision): DEFAULT FLIPPED to no-hold — a constructed guess now
+        // DRAFTS with a non-deletable [VERIFY] subject prefix (verify the recipient before
+        // sending) instead of parking, so the operator gets a draft for EVERY lead. Opt BACK IN
+        // to parking (to avoid bounce-prone fabricated guesses) via ScriptProperty
+        // CONSTRUCTED_TIER_PARK_ENABLED='1'. The park MECHANISM below is unchanged; only its
+        // default gate flipped (!== '0'  →  === '1').
+        // NOTE (@286): a constructed guess the finalizer's Reoon PROBE confirmed deliverable is
+        // elevated to low_confidence/best_of_available BEFORE reaching here, so it never parks
+        // (deliverable ⇒ not bounce-prone). Only UNPROBED/INVALID constructs (still tier=
+        // 'constructed', conf 0.20) are subject to this park.
+        var _constructedPark = false;
+        try { _constructedPark = (PropertiesService.getScriptProperties().getProperty('CONSTRUCTED_TIER_PARK_ENABLED') === '1'); } catch (_cpErr) {}
+        if (_constructedPark && finalized.tier === 'constructed') {
+          var _cpNotes = '[EMAIL_UNVERIFIED_CONSTRUCTED conf=' + _vhConf + '% tier=constructed] fabricated-pattern guess ' +
+            finalized.email + ' PARKED (not drafted — would bounce on a non-catch-all domain). Supply a real address via ' +
+            'menuFixEmployerAndPromote(' + lead.rowNum + ', "<Org>|<email>") or skip.';
+          logPipelineEvent(lead.rowNum, 'ENRICH', _cpNotes, 'WARN');
+          try {
+            _uf(lead, {
+              ENRICHED_EMAIL:   finalized.email,
+              EMAIL_SOURCE:     finalized.source,
+              EMAIL_CONFIDENCE: finalized.confidence.toFixed(2),
+              STATUS:           'VERIFY_EMAIL',
+              NOTES:            _cpNotes.substring(0, 1900)
+            });
+          } catch (_cpwErr) {
+            Logger.log('[BatchProcessor] constructed-tier park write failed: ' + _cpwErr.message);
+          }
+          return;  // pure fabricated guess parked — never blind-drafted/sent
+        }
+        var _hardHold = false;
+        try { _hardHold = (PropertiesService.getScriptProperties().getProperty('EMAIL_VERIFY_HARD_HOLD') === '1'); } catch (_hhErr) {}
+        if (_hardHold) {
+          // Opt-in legacy behavior: park the unverified guess (no draft) for manual promotion.
+          var _vhNotes = '[EMAIL_UNVERIFIED conf=' + _vhConf + '% tier=' + finalized.tier + '] guessed ' +
+            finalized.email + ' — verify, then menuPromoteEmailVerify(' + lead.rowNum + '). (EMAIL_VERIFY_HARD_HOLD on)';
+          logPipelineEvent(lead.rowNum, 'ENRICH', _vhNotes, 'WARN');
+          try {
+            _uf(lead, {
+              ENRICHED_EMAIL:   finalized.email,
+              EMAIL_SOURCE:     finalized.source,
+              EMAIL_CONFIDENCE: finalized.confidence.toFixed(2),
+              STATUS:           'VERIFY_EMAIL',
+              NOTES:            _vhNotes.substring(0, 1900)
+            });
+          } catch (_vhErr) {
+            Logger.log('[BatchProcessor] VERIFY_EMAIL hard-hold write failed: ' + _vhErr.message);
+          }
+          return;  // held only because the operator explicitly opted back in
+        }
+        // DEFAULT — no hold: annotate the low confidence and PROCEED to compose+draft.
+        // lead.email is already set by the finalizer; EMAIL_CONFIDENCE (low) is the durable,
+        // filterable flag the operator reviews before sending. No status change here — the
+        // draft stage sets DRAFT_CREATED so the lead keeps moving.
+        var _lcNote = '[LOW_CONFIDENCE_DRAFT conf=' + _vhConf + '% tier=' + finalized.tier + '] drafting ' +
+          finalized.email + ' — VERIFY recipient before sending (best-available guess; not held).';
+        logPipelineEvent(lead.rowNum, 'ENRICH', _lcNote, 'WARN');
+        try {
+          _uf(lead, {
+            ENRICHED_EMAIL:   finalized.email,
+            EMAIL_SOURCE:     finalized.source,
+            EMAIL_CONFIDENCE: finalized.confidence.toFixed(2),
+            NOTES:            _lcNote.substring(0, 1900)
+          });
+        } catch (_lcErr) {
+          Logger.log('[BatchProcessor] low-confidence annotate write failed: ' + _lcErr.message);
+        }
+        // fall through → Stage 2 compose → createDraft (no return)
+      }
+
       // PATCH `-eq8-content-fix` (#6): stash the enrichment-resolved domain on
       // the lead so the research stage can anchor its grounded search to the
       // RIGHT company. Without this, research queried the bare org name and
@@ -1216,6 +1588,13 @@ function _processOneLead(lead) {
         var _rd = (finalized.email || '').toString().split('@')[1] || '';
         // Don't anchor on the placeholder domain — it's not a real company domain.
         if (_rd && _rd.indexOf('placeholder.invalid') < 0) lead.resolvedDomain = _rd;
+      } catch (_) {}
+      // A2-Apollo (2026-06-23): stash Apollo's CURRENT employer-of-record (already
+      // fetched; zero extra API) for the Stage 6.95 cross-check. Support signal only.
+      try {
+        if (enrichment && enrichment.apolloMatch && enrichment.apolloMatch.organizationName) {
+          lead.apolloCurrentOrg = enrichment.apolloMatch.organizationName;
+        }
       } catch (_) {}
       // Continue to Stage 2 regardless of tier.
     } else if (enrichment.email && enrichment.email !== lead.email) {
@@ -1246,6 +1625,12 @@ function _processOneLead(lead) {
           var _rdFallback = (finalizedFallback.email || '').toString().split('@')[1] || '';
           if (_rdFallback && _rdFallback.indexOf('placeholder.invalid') < 0) {
             lead.resolvedDomain = _rdFallback;
+          }
+        } catch (_) {}
+        // A2-Apollo: mirror the Apollo current-employer stash on the fallback path.
+        try {
+          if (finalizedFallback && finalizedFallback.apolloMatch && finalizedFallback.apolloMatch.organizationName) {
+            lead.apolloCurrentOrg = finalizedFallback.apolloMatch.organizationName;
           }
         } catch (_) {}
         try {
@@ -1692,9 +2077,19 @@ function _processOneLead(lead) {
       var _domainTokens = (_domainSld + '').toLowerCase()
         .split(/[^a-z]+/)
         .filter(function(t) { return t.length >= 4; });
-      var _hasOverlap = _orgTokens.some(function(ot) {
-        return _domainTokens.some(function(dt) { return ot === dt; });
-      });
+      // PATCH 2026-06-23 (F2 email-core): delegate the overlap test to the SHARED
+      // _orgTokenOverlapSubstr helper (EmailFinalizer.gs) so this Stage-6.9 advisory
+      // uses the SAME substring-containment definition as the finalizer org-domain
+      // GATE and the Stage-6.95 Apollo cross-check. Previously this used exact token
+      // equality only, so it DIVERGED from the gate — e.g. it false-flagged org
+      // "Proofpoint" against domain "proofpointinc.com" that the gate treats as a
+      // match. Falls back to the legacy exact-equality check only if the shared
+      // helper is somehow unavailable in load order.
+      var _hasOverlap = (typeof _orgTokenOverlapSubstr === 'function')
+        ? _orgTokenOverlapSubstr(_orgTokens, _domainTokens)
+        : _orgTokens.some(function(ot) {
+            return _domainTokens.some(function(dt) { return ot === dt; });
+          });
       if (!_hasOverlap && _orgTokens.length > 0 && _domainTokens.length > 0) {
         var _orgMismatchNote = 'ORG_RECIPIENT_MISMATCH_ADVISORY: subject-org "' +
           lead.organization + '" vs recipient-domain "' + lead.resolvedDomain + '"';
@@ -1732,6 +2127,169 @@ function _processOneLead(lead) {
     }
   } catch (_orgMismatchErr) {
     Logger.log('[BatchProcessor] org_recipient_mismatch check failed (non-blocking): ' + _orgMismatchErr.message);
+  }
+
+  // ── Stage 6.95: Apollo current-employer cross-check (2026-06-23, A2-Apollo) ──
+  // Flag-only (Apollo = SUPPORT, not authority): if Apollo's CURRENT employer-of-
+  // record disagrees with the chosen recipient's email domain OR with the sheet
+  // org, raise org_recipient_mismatch -> which drives the non-deletable [VERIFY]
+  // subject prefix. Catches the real-but-wrong-company class the org-string guard
+  // can't see (Jyotirmay: org=Porter is correct but email @nykaa.com is a stale
+  // PAST employer; Anindya: org=Shri Ram but Apollo says Titan). NEVER mutates
+  // email/org. Silent when Apollo is missing/ambiguous. Kill-switch ScriptProperty
+  // APOLLO_EMPLOYER_CROSSCHECK_ENABLED='0'.
+  try {
+    var _apXOn = true;
+    try { _apXOn = (PropertiesService.getScriptProperties().getProperty('APOLLO_EMPLOYER_CROSSCHECK_ENABLED') !== '0'); } catch (_) {}
+    var _apOrg = (lead.apolloCurrentOrg || '').toString().trim();
+    if (_apXOn && _apOrg) {
+      var _apTok = _apOrg.toLowerCase().split(/[^a-z]+/).filter(function (t) { return t.length >= 4; });
+      var _apOverlap = function (aTok, bStr) {
+        var bTok = (bStr || '').toString().toLowerCase().split(/[^a-z]+/).filter(function (t) { return t.length >= 4; });
+        if (!aTok.length || !bTok.length) return null; // not enough signal -> no judgment, no flag
+        return aTok.some(function (at) {
+          return bTok.some(function (bt) { return at === bt || at.indexOf(bt) >= 0 || bt.indexOf(at) >= 0; });
+        });
+      };
+      var _apRecipDomain = (lead.email || '').toString().split('@')[1] || '';
+      var _apRecipSld = (typeof _baseDomain === 'function') ? _baseDomain(_apRecipDomain) : _apRecipDomain;
+      var _apD1 = _apOverlap(_apTok, _apRecipSld);                  // Apollo-org vs recipient domain
+      var _apD2 = (lead.organization && String(lead.organization).trim())
+        ? _apOverlap(_apTok, lead.organization) : null;             // Apollo-org vs sheet org
+      if (_apD1 === false || _apD2 === false) {  // false = computed AND zero overlap
+        var _apNote = 'APOLLO_EMPLOYER_MISMATCH_ADVISORY: Apollo current employer "' + _apOrg +
+          '" disagrees with recipient-domain "' + _apRecipSld + '" / sheet-org "' + (lead.organization || '') + '"';
+        Logger.log('[BatchProcessor] ' + _apNote + ' row=' + lead.rowNum);
+        try {
+          var _apLiveNotes = '';
+          try {
+            var _apSh = ((typeof _svc === 'function') ? _svc('Sheets') : SpreadsheetApp).openById(CONFIG.SHEET_ID).getSheetByName(CONFIG.DATA_SHEET);
+            if (_apSh) _apLiveNotes = (_apSh.getRange(lead.rowNum, CONFIG.COLUMNS.NOTES).getValue() || '').toString().trim();
+          } catch (_) { _apLiveNotes = (lead.notes || '').toString().trim(); }
+          _uf(lead, { NOTES: (_apLiveNotes ? _apLiveNotes + ' | ' : '') + _apNote });
+        } catch (_) {}
+        lead.riskFlags = lead.riskFlags || [];
+        if (lead.riskFlags.indexOf('org_recipient_mismatch') < 0) {
+          lead.riskFlags.push('org_recipient_mismatch');
+        }
+      }
+    }
+  } catch (_apolloXErr) {
+    Logger.log('[BatchProcessor] Apollo employer cross-check failed (non-blocking): ' + _apolloXErr.message);
+  }
+
+  // ── Stage 6.96: Candidate disagreement advisory (F5 email-core, 2026-06-23) ──
+  // Disagreement-aware confidence (research §6): when the selector's top runner-up sits
+  // at a DIFFERENT domain with a near-equal score, the engine is genuinely unsure WHICH
+  // company/address is right. The additive scorer rewards agreement but NEVER lowers the
+  // winner for a strong conflicting alternative — so a confident-looking VERIFIED draft can
+  // hide a coin-flip. We surface it as the riskFlag 'email_disagreement' (drives the
+  // non-deletable [VERIFY] subject prefix) so the human glances. Flag-only — never mutates
+  // email/org. Meaningful only when the selector actually ran (enrichment.runnerUps present)
+  // AND the finalizer kept the selector winner (so the runner-up is a real alternative to it).
+  try {
+    var _dgRU = (enrichment && enrichment.runnerUps) || [];
+    if (_dgRU.length > 0 && enrichment.email && lead.email &&
+        String(enrichment.email).toLowerCase() === String(lead.email).toLowerCase()) {
+      var _dgBase = function (em) {
+        var d = (String(em || '').split('@')[1] || '');
+        return (typeof _baseDomain === 'function') ? _baseDomain(d) : d;
+      };
+      var _dgWinDom = _dgBase(enrichment.email);
+      var _dgTop = _dgRU[0];
+      var _dgRuDom = _dgBase(_dgTop.email);
+      var _dgWinScore = enrichment.score || 0;
+      var _dgRuScore = _dgTop.score || 0;
+      // strong competitor (>=80% of the winner's score) at a DIFFERENT base domain
+      if (_dgRuDom && _dgWinDom && _dgRuDom !== _dgWinDom &&
+          _dgWinScore > 0 && _dgRuScore >= _dgWinScore * 0.80) {
+        // Phase B (org-anchor, 2026-06-23): only FLAG when the winner is NOT demonstrably
+        // org-consistent. If the winner's domain already matches the org field, the
+        // disagreement is BENIGN (a wrong-company runner-up losing to the right winner) →
+        // no flag, no noise. Only when the winner does NOT match the org (the engine may
+        // have picked the WRONG company — e.g. a wrong-person Apollo match outscoring the
+        // org-correct pattern, a top forensic risk) do we surface [VERIFY]. Auto-SWITCHING
+        // to the org-consistent runner-up is the shadow-validated next step. If the org
+        // can't anchor (empty / <4-char tokens), we cannot rule it benign → flag.
+        var _dgOrgTok = String(lead.organization || '').toLowerCase().split(/[^a-z]+/).filter(function (t) { return t.length >= 4; });
+        var _dgWinTok = _dgWinDom.toLowerCase().split(/[^a-z]+/).filter(function (t) { return t.length >= 4; });
+        var _dgWinnerOrgConsistent = (_dgOrgTok.length > 0 && _dgWinTok.length > 0 &&
+          typeof _orgTokenOverlapSubstr === 'function') ? _orgTokenOverlapSubstr(_dgOrgTok, _dgWinTok) : false;
+        if (_dgWinnerOrgConsistent) {
+          Logger.log('[BatchProcessor] disagreement BENIGN (winner ' + enrichment.email +
+            ' is org-consistent) — no flag, row=' + lead.rowNum);
+        } else {
+          var _dgNote = 'EMAIL_DISAGREEMENT_ADVISORY: winner ' + enrichment.email + ' (score ' + _dgWinScore +
+            ') vs strong runner-up ' + _dgTop.email + ' (score ' + _dgRuScore + ') at a DIFFERENT domain, winner NOT org-consistent — verify which company is right';
+          Logger.log('[BatchProcessor] ' + _dgNote + ' row=' + lead.rowNum);
+          try {
+            var _dgLiveNotes = '';
+            try {
+              var _dgSh = ((typeof _svc === 'function') ? _svc('Sheets') : SpreadsheetApp).openById(CONFIG.SHEET_ID).getSheetByName(CONFIG.DATA_SHEET);
+              if (_dgSh) _dgLiveNotes = (_dgSh.getRange(lead.rowNum, CONFIG.COLUMNS.NOTES).getValue() || '').toString().trim();
+            } catch (_) { _dgLiveNotes = (lead.notes || '').toString().trim(); }
+            _uf(lead, { NOTES: (_dgLiveNotes ? _dgLiveNotes + ' | ' : '') + _dgNote });
+          } catch (_) {}
+          lead.riskFlags = lead.riskFlags || [];
+          if (lead.riskFlags.indexOf('email_disagreement') < 0) {
+            lead.riskFlags.push('email_disagreement');
+          }
+        }
+      }
+    }
+  } catch (_dgErr) {
+    Logger.log('[BatchProcessor] disagreement check failed (non-blocking): ' + _dgErr.message);
+  }
+
+  // ── Stage 6.97: Org-anchor RESOLUTION shadow (Phase C SHADOW, 2026-06-23) ──
+  // The accuracy goal: when the recipient domain mismatches the org (stale / past-employer
+  // email — e.g. org=Porter but email @nykaa.com), don't just FLAG it — RE-DERIVE at the
+  // org's own domain and SWITCH the recipient. That mutates the recipient and leans on the
+  // org being right (sometimes it's junk), so it ships SHADOW-FIRST: when org_recipient_mismatch
+  // is set AND the org is trustworthy (non-junk), resolve the org's canonical domain with the
+  // SAME resolver the live switch would use (resolveDomainContextual), construct the proposed
+  // address, and LOG it (PipelineLog 'ORG_ANCHOR_SHADOW') — but DO NOT switch. A later cycle
+  // joins these proposals to bounce outcomes to PROVE the switch reduces bounces before we
+  // promote it to a live auto-switch. Also surfaces Stage-6.9 substring false-positives
+  // (orgDomain == recipient domain → wouldSwitch=false). Gated by ScriptProperty
+  // ORG_ANCHOR_SHADOW (default ON; '0' disables — note: adds ONE cached domain-resolve per
+  // mismatch lead). Never throws, never mutates email/org/status.
+  try {
+    var _oaShadowOn = true;
+    try { _oaShadowOn = (PropertiesService.getScriptProperties().getProperty('ORG_ANCHOR_SHADOW') !== '0'); } catch (_) {}
+    var _oaMismatch = lead.riskFlags && lead.riskFlags.indexOf('org_recipient_mismatch') >= 0;
+    var _oaOrg = String(lead.organization || '').trim();
+    var _oaJunk = (typeof _looksLikeNonCompanyOrg === 'function') ? _looksLikeNonCompanyOrg(_oaOrg) : false;
+    if (_oaShadowOn && _oaMismatch && _oaOrg && !_oaJunk && lead.email &&
+        typeof resolveDomainContextual === 'function') {
+      var _oaParts = String(lead.fullName || '').trim().split(/\s+/);
+      var _oaFirst = _oaParts[0] || '';
+      var _oaLast = _oaParts.length > 1 ? _oaParts[_oaParts.length - 1] : '';
+      var _oaResolved = null;
+      try { _oaResolved = resolveDomainContextual(_oaOrg, { firstName: _oaFirst, lastName: _oaLast }); } catch (_) {}
+      var _oaOrgDomain = (_oaResolved && _oaResolved.domain) ? _oaResolved.domain : '';
+      var _oaBase = function (d) { return (typeof _baseDomain === 'function') ? _baseDomain(d) : d; };
+      var _oaOrigDomain = _oaBase(lead.email.split('@')[1] || '');
+      if (_oaOrgDomain && _oaBase(_oaOrgDomain) !== _oaOrigDomain) {
+        var _oaGuesses = (typeof guessProfessionalEmail === 'function')
+          ? guessProfessionalEmail(_oaFirst, _oaLast, _oaOrgDomain) : [];
+        var _oaProposed = _oaGuesses[0] ||
+          ((_oaFirst ? _oaFirst.toLowerCase().replace(/[^a-z]/g, '') : 'unknown') + '@' + _oaOrgDomain);
+        logPipelineEvent(lead.rowNum, 'ORG_ANCHOR_SHADOW',
+          'orig=' + lead.email + ' origDomain=' + _oaOrigDomain + ' org="' + _oaOrg +
+          '" orgDomain=' + _oaOrgDomain + ' orgDomainConf=' + ((_oaResolved && _oaResolved.confidence) || '') +
+          ' proposed=' + _oaProposed + ' wouldSwitch=true (SHADOW — not switched)', 'INFO');
+      } else if (_oaOrgDomain) {
+        logPipelineEvent(lead.rowNum, 'ORG_ANCHOR_SHADOW',
+          'orig=' + lead.email + ' org="' + _oaOrg + '" orgDomain=' + _oaOrgDomain +
+          ' wouldSwitch=false (org domain == recipient domain — Stage-6.9 substring false-positive)', 'INFO');
+      } else {
+        logPipelineEvent(lead.rowNum, 'ORG_ANCHOR_SHADOW',
+          'orig=' + lead.email + ' org="' + _oaOrg + '" orgDomain=UNRESOLVED wouldSwitch=unknown (SHADOW)', 'INFO');
+      }
+    }
+  } catch (_oaErr) {
+    Logger.log('[BatchProcessor] org-anchor shadow failed (non-blocking): ' + _oaErr.message);
   }
 
   // ── Stage 7: Write Results ──
@@ -2274,11 +2832,19 @@ function _persistFollowUps(lead, followUps) {
       var existingData = sheet.getRange(2, 1, existingLastRow - 1, sheet.getLastColumn()).getValues();
       existingData.forEach(function(row) {
         var rowStatus = (row[idx['Status']] || '').toString().trim();
-        if (rowStatus === 'PENDING') {
+        // -p7-followup-identity: include SENT (not just PENDING) so a re-draft AFTER
+        // an earlier sequence already fired can't schedule a second one. Invariant:
+        // one follow-up sequence per lead+stage, ever. (CANCELLED is excluded — a
+        // superseded row should not block a legitimate reschedule.)
+        if (rowStatus === 'PENDING' || rowStatus === 'SENT') {
           var rowEmail = (row[idx['Email']] || '').toString().trim().toLowerCase();
           var rowStage = (row[idx['Stage']] || '').toString().trim();
-          if (rowEmail && rowStage) {
-            existingPendingSet[rowEmail + '|' + rowStage] = true;
+          // Key on STABLE identity (ParentRow) not email, so a second set scheduled
+          // after an email correction (Wishlink→Lendbox) is caught as a duplicate.
+          var rowParent = (idx['ParentRow'] !== undefined) ? row[idx['ParentRow']] : '';
+          if ((rowEmail || rowParent) && rowStage) {
+            var idKey = (typeof _fuIdentityKey_ === 'function') ? _fuIdentityKey_(rowParent, rowEmail) : ('email:' + rowEmail);
+            existingPendingSet[idKey + '|' + rowStage] = true;
           }
         }
       });
@@ -2299,10 +2865,14 @@ function _persistFollowUps(lead, followUps) {
       placeholderDate = new Date(now.getTime() + (f.offsetDays || 0) * 86400000);
     }
 
-    // FIX 3a dedup check: skip if PENDING row for same (email, stage) already exists
-    var dedupKey = (lead.email || '').toString().trim().toLowerCase() + '|' + (f.stage || '').toString().trim();
+    // FIX 3a dedup check: skip if a PENDING row for the same (identity, stage) exists.
+    // -p7-followup-identity: identity = ParentRow (stable) when available, else email.
+    var _dkId = (typeof _fuIdentityKey_ === 'function')
+      ? _fuIdentityKey_(lead.rowNum, lead.email)
+      : ('email:' + (lead.email || '').toString().trim().toLowerCase());
+    var dedupKey = _dkId + '|' + (f.stage || '').toString().trim();
     if (existingPendingSet[dedupKey]) {
-      Logger.log('[FollowUp] dedup skip email=' + (lead.email || '') + ' stage=' + (f.stage || ''));
+      Logger.log('[FollowUp] dedup skip identity=' + _dkId + ' stage=' + (f.stage || ''));
       return; // skip appendRow
     }
     existingPendingSet[dedupKey] = true; // mark so subsequent stages in same call don't double-write

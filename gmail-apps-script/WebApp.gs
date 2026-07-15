@@ -1005,6 +1005,13 @@ function doGet(e) {
       var WHITELIST = {
         // Diagnostics (read-only)
         'menuDiagnoseDispatch':            function() { return menuDiagnoseDispatch(); },
+        // PATCH 2026-06-23 (archetype-override): pin a lead's archetype when the scraped
+        // title is ambiguous (e.g. campus recruiting mislabeled "Campus & Alternate Channels").
+        // ScriptProperty write only (ARCHETYPE_OVERRIDES) — not a mail send/delete op.
+        'menuSetArchetypeOverride':        function(a, s) { return menuSetArchetypeOverride(a, s); },
+        // PATCH 2026-06-23 (operator candidate email): set a TENTATIVE recipient address
+        // (drafts with [VERIFY], never verified/blind-sent). ScriptProperty write only.
+        'menuSetCandidateEmail':           function(a, s) { return menuSetCandidateEmail(a, s); },
         'menuSampleNewRows':               function() { return menuSampleNewRows(); },
         'menuEQ2_TrimWindowCheck':         function() { return menuEQ2_TrimWindowCheck(); },
         'menuEQ2_BaselineReport':          function(a) { return menuEQ2_BaselineReport(a); },
@@ -1032,6 +1039,20 @@ function doGet(e) {
         'menuPurgeStaleVendorCaches':      function() { return menuPurgeStaleVendorCaches(); },
         'menuPurgeAggressive':             function(a) { return menuPurgeAggressive(typeof a === 'number' ? a : 3); },
         'menuCleanStaleAutoProcessedProperties': function() { return menuCleanStaleAutoProcessedProperties(); },
+        // PATCH 2026-07-06-cellceiling-relief: the workbook hit the 10,000,000-cell
+        // hard limit (runHealthCheck append threw "would increase the number of cells
+        // above the limit of 10000000 cells"), which silently freezes ALL intake
+        // appendRow. These two GmailDrafter helpers let the bridge (a) inventory
+        // per-sheet cell usage to confirm the bloat source [read-only], and (b) trim
+        // the unbounded PipelineLog to its 7-day / 50k-row retention [deletes log rows
+        // only — no lead/draft data]. Trim is lock-guarded like the other sheet-mutating
+        // entries so it can't race the 30-min watchdog auto-trim.
+        'menuShowSheetCellUsage':          function() { return menuShowSheetCellUsage(); },
+        'menuTrimPipelineLog':             function(a) { return _adminRunWithLock_(function() { return menuTrimPipelineLog(typeof a === 'number' ? a : undefined); }); },
+        // The actual 10M-cell bloat was scanner_shadow_diff (~9.3M cells, dead
+        // post-promotion), NOT PipelineLog. This clears it (delete+recreate with
+        // header); self-gated to refuse while USE_LEGACY_SCANNER !== false.
+        'menuClearScannerShadowDiff':      function() { return _adminRunWithLock_(function() { return menuClearScannerShadowDiff(); }); },
         // PATCH 2026-06-12-deleted-stays-deleted: idempotent repair sweep —
         // reverts rows the watchdog resurrected from user-deleted drafts
         // before deletion became permanent. Sheet STATUS writes only, so it
@@ -1069,6 +1090,11 @@ function doGet(e) {
         // menuPurgeDuplicateFollowups is write (cancels duplicate PENDING rows) — lock-guarded.
         'menuFollowupAudit':               function() { return menuFollowupAudit(); },
         'menuPurgeDuplicateFollowups':     function() { return _adminRunWithLock_(function() { return menuPurgeDuplicateFollowups(); }); },
+        // PATCH -p7-followup-identity: follow-up row dump (read-only) + cross-email
+        // duplicate cleanup (cancels a lead's 2nd follow-up set scheduled under a
+        // corrected email — the Samriddhi Wishlink→Lendbox class). argS='execute' writes.
+        'menuFollowupsForLead':            function(a, s) { return menuFollowupsForLead(a, s); },
+        'menuCleanupCrossEmailFollowups':  function(a, s) { return _adminRunWithLock_(function() { return menuCleanupCrossEmailFollowups(a, s); }); },
         // PATCH 2026-06-13-final-cert: trigger dedup + reconcile. Deletes extras (one-shot
         // accumulation root cause), reinstalls any missing canonical time-driven triggers,
         // brings total count under 17 (3 headroom). NOT a send/delete mail operation.
@@ -1077,6 +1103,17 @@ function doGet(e) {
         // Confirms credits are live after a refill without consuming enrichment credits.
         // Does NOT write to the SNOV_400 breaker — pure diagnostic. No lock needed.
         'menuPingSnov':                    function() { return menuPingSnov(); },
+        // PATCH -p5-vendorfailover: vendor account + circuit-breaker diagnostics.
+        // menuCheckVendorAccounts is read-only (Hunter /account + Apollo /auth/health
+        // — Apollo health does NOT consume credits — + breaker snapshot). No lock.
+        // menuResetVendorBreaker(argS=provider) resets a circuit after a top-up; the
+        // vendorHealth property is self-locked (LockService), so no admin mutex needed.
+        'menuCheckVendorAccounts':         function() { return menuCheckVendorAccounts(); },
+        'menuResetVendorBreaker':          function(a, s) { return menuResetVendorBreaker(s || a); },
+        // PATCH -p6-accuracy-ledger: read-only ground-truth accuracy report —
+        // joins STATUS outcome × EMAIL_SOURCE × confidence band into bounce/reply/
+        // delete rates per source. arg1 = days window (0/blank = all-time). No lock.
+        'menuAccuracyLedger':              function(a) { return menuAccuracyLedger(a); },
         // PATCH 2026-06-13-orggate-substr: reset leads stranded by the old exact-token
         // org-domain gate (notes contain [ORG_DOMAIN_GATE] or NEEDS_EMAIL_REVIEW +
         // empty enrichedEmail). Clears enrichment cols, sets STATUS=NEW so the scanner
@@ -1120,7 +1157,50 @@ function doGet(e) {
         'menuRemoveSheet1Filter':          function() { return menuRemoveSheet1Filter(); },
         // PATCH 2026-06-17-employer-reconcile: reset one lead (arg1=rowNum) to NEW so the
         // scanner reprocesses it with current logic (e.g. after the headline-vs-org fix).
-        'menuResetLeadToNew':              function(a) { return _adminRunWithLock_(function() { return menuResetLeadToNew(a); }); }
+        'menuResetLeadToNew':              function(a) { return _adminRunWithLock_(function() { return menuResetLeadToNew(a); }); },
+        // PATCH 2026-06-17-verify-email-hold: promote a VERIFY_EMAIL-held lead (arg1=rowNum)
+        // to NEW once the user has confirmed the guessed address — bypasses the hold gate.
+        'menuPromoteEmailVerify':          function(a) { return _adminRunWithLock_(function() { return menuPromoteEmailVerify(a); }); },
+        // PATCH 2026-06-19-email-lock: correct a held lead's address to a human-verified one
+        // and promote SAFELY (writes [EMAIL_LOCKED] so the finalizer won't re-derive a wrong guess).
+        'menuCorrectAndPromoteEmail':      function(a, s) { return _adminRunWithLock_(function() { return menuCorrectAndPromoteEmail(a, s); }); },
+        // PATCH 2026-06-19-trust-org: toggle headline→org override; unlock+hold a suspect lead.
+        'menuSetEmployerReconcileEnabled': function(a) { return _adminRunWithLock_(function() { return menuSetEmployerReconcileEnabled(a); }); },
+        'menuUnlockEmailAndHold':          function(a, s) { return _adminRunWithLock_(function() { return menuUnlockEmailAndHold(a, s); }); },
+        // PATCH 2026-06-19-org-override: set a human-verified employer + email and promote (fixes body AND recipient).
+        'menuFixEmployerAndPromote':       function(a, s) { return _adminRunWithLock_(function() { return menuFixEmployerAndPromote(a, s); }); },
+        // PATCH 2026-06-20-sheet2-spill: diagnose (arg1=0) / repair (arg1=1) a stalled UNIQUE(Sheet1) spill.
+        'menuRepairSheet2Spill':           function(a) { return _adminRunWithLock_(function() { return menuRepairSheet2Spill(a); }); },
+        // PATCH 2026-06-20-fu-scrub: delete pre-fix self-addressed follow-up drafts + reset rows to regen (arg1=1).
+        'menuScrubSelfAddressedFollowups': function(a) { return _adminRunWithLock_(function() { return menuScrubSelfAddressedFollowups(a); }); },
+        // PATCH 2026-06-20-purge-stale: delete unsent drafts older than arg1 days (default 5); argS='execute' to delete.
+        'menuPurgeStaleUnsentDrafts':      function(a, s) { return _adminRunWithLock_(function() { return menuPurgeStaleUnsentDrafts(a, s); }); },
+        // PATCH 2026-06-20-leadphones: compile captured (Sheet1 H) + reply-signature phones into a LeadPhones sheet (arg1=1 writes).
+        'menuCompileLeadPhones':           function(a) { return _adminRunWithLock_(function() { return menuCompileLeadPhones(a); }); },
+        // PATCH 2026-06-20-leaddiag: read-only deep lookup of a lead by name across Sheet1 + Sheet2 (argS=name).
+        'menuDiagnoseLeadByName':          function(a, s) { return menuDiagnoseLeadByName(s); },
+        // PATCH 2026-06-18-draftsync-probe: read-only — test whether stored DRAFT_IDs still
+        // resolve via getDraft (true deletion vs false DRAFT_DELETED from a transient error).
+        'menuProbeDraftId':                function(a, s) { return menuProbeDraftId(a, s); },
+        // PATCH 2026-06-18-draftsync-transient: RECOVERY — restore leads falsely marked
+        // DRAFT_DELETED whose Gmail draft still exists. arg1 = max probes/run (default 300).
+        'menuRestoreFalseDeletedDrafts':   function(a) { return _adminRunWithLock_(function() { return menuRestoreFalseDeletedDrafts(a); }); },
+        // PATCH 2026-06-19-whoami: which Gmail account holds the drafts (read-only).
+        'menuWhoAmI':                      function() { return menuWhoAmI(); },
+        // PATCH 2026-06-19-fu-thread: show a lead's thread + its pending follow-up reply drafts (read-only).
+        'menuShowFollowUpThread':          function(a, s) { return menuShowFollowUpThread(a, s); },
+        // PATCH 2026-06-19-fu-recipient: probe whether createDraftReply(+to) / createDraftReplyAll
+        // address the LEAD vs self on a self-started thread; creates+deletes probe drafts (read-only).
+        'menuTestReplyTo':                 function(a, s) { return menuTestReplyTo(a, s); },
+        // PATCH 2026-06-19-fu-recipient: verify the FIXED path — Advanced-Service threaded draft
+        // addressed to the recipient (not self) + GmailApp draftId resolvability; auto-deletes probe.
+        'menuTestGmailApiDraft':           function(a, s) { return menuTestGmailApiDraft(a, s); },
+        // PATCH 2026-06-19-email-accuracy: READ-ONLY shadow of the current-employer-domain-anchored
+        // email selection — reports what the durable fix would change vs the current pick. No writes.
+        'menuShadowEmailDiff':             function(a, s) { return menuShadowEmailDiff(a, s); },
+        // PATCH 2026-06-19-headline-exseg: READ-ONLY — show the keystone parser's current-employer
+        // extraction per recent lead + which rows it would override (eyeball before relying on it).
+        'menuShadowEmployerParse':         function(a, s) { return menuShadowEmployerParse(a, s); }
       };
 
       if (!fnName || !WHITELIST.hasOwnProperty(fnName)) {
@@ -2068,6 +2148,24 @@ function _handleApkPayload(data) {
   // Tests: leaduid_dedup_same_url_within_window_reuses_uid (logic),
   //        webapp_dedup_concurrent_same_url_appends_one_row (race).
   var linkedinUrl = data.linkedinUrl || '';
+  // VERIFY-FIX (2026-07-06-apk-guess-gate): the app's never-blank fallback POSTs a LOW-
+  // confidence pattern GUESS (emailSource='pattern_guess_unverified'). Sheet1's 12-col
+  // schema can't carry the source, so writing that guess into col G lets EmailFinalizer's
+  // S1 sheet-email precedence finalize it as source='sheet_captured' tier='verified' with
+  // NO [VERIFY] flag (worse while the Reoon breaker is skipped). Drop the guess here so the
+  // server re-derives + Reoon-gates + [VERIFY]-flags it. The app still DISPLAYS its guess
+  // on-device — this only governs what the pipeline treats as a captured address.
+  // Kill-switch: APK_GUESS_EMAIL_GATE_ENABLED='0' restores the raw pass-through.
+  var _apkEmailSrc = String(data.emailSource || '').toLowerCase();
+  var _apkGuessGateOn = PropertiesService.getScriptProperties()
+                          .getProperty('APK_GUESS_EMAIL_GATE_ENABLED') !== '0';
+  var _apkEmailIsGuess = _apkGuessGateOn &&
+        (_apkEmailSrc.indexOf('guess') !== -1 || _apkEmailSrc.indexOf('unverified') !== -1);
+  var _apkEmailForSheet = _apkEmailIsGuess ? '' : (data.email || '');
+  if (_apkEmailIsGuess) {
+    Logger.log('[WebApp] APK pattern-guess email dropped from col G (source=' + _apkEmailSrc +
+               '); server will enrich + [VERIFY]. was: ' + (data.email || ''));
+  }
   var capture = _resolveCaptureUid_(sheet1, linkedinUrl, function(uid) {
     return [
       data.timestamp || new Date().toISOString(),
@@ -2076,7 +2174,7 @@ function _handleApkPayload(data) {
       data.headline || '',
       data.currentDesignation || data.designation || '',
       data.currentOrganization || data.organization || '',
-      data.email || '',
+      _apkEmailForSheet,
       data.phone || '',
       data.website || '',
       data.location || '',
@@ -2773,35 +2871,32 @@ function _sanitizeIncomingPayload(data) {
     p.organization = '';
   }
 
-  // 5b. PATCH 2026-05-13 — HEADLINE-PARSE FALLBACK for missing organization.
-  //
-  // RCA finding (Arjun Juneja / Nothing): Gemini Vision in the APK sometimes
-  // returns empty currentDesignation + currentOrganization (e.g., Experience
-  // section not visible in the 7-screenshot capture window). The APK still
-  // POSTs the headline though, which usually contains the org name.
-  //
-  // Server-side fallback: when organization is blank but a headline is present,
-  // try to extract the org. Common headline patterns:
-  //   "Product Manager at Nothing"       → " at " split
-  //   "Senior PM @ Linear"               → " @ " split
-  //   "Growth Lead, Razorpay"            → ", " split (org is last segment)
-  //   "Engineer · Stripe · San Francisco"→ " · " split (segment that capitalizes)
-  //
-  // Confidence is low — this is a last-resort fallback. The output is a single
-  // capitalized noun phrase. Downstream enrichment runs name-similarity guards
-  // (Clearbit / Apollo) so a wrong guess is filtered out.
-  var hasOrgAlready = !!((p.currentOrganization && p.currentOrganization.trim()) ||
-                         (p.organization && p.organization.trim()));
-  var headlineSrc = (p.headline || '').toString().trim();
-  if (!hasOrgAlready && headlineSrc) {
-    var extractedOrg = _extractOrgFromHeadlineServer(headlineSrc);
-    if (extractedOrg) {
-      p.currentOrganization = extractedOrg;
-      p.organization = extractedOrg;
-      Logger.log('[WebApp] _sanitize: organization derived from headline "' +
-                 headlineSrc + '" → "' + extractedOrg + '"');
-    }
+  // 5a-2. 2026-06-22 — blank a NON-COMPANY org (tagline / program / education) that
+  // the old-APK headline fallback emits NON-empty (so 5a above misses it). The email
+  // engine would derive a junk domain from it; blanking parks the lead at NEEDS_EMAIL
+  // instead of emailing a wrong recipient. App-side v1.0.15 fixes the capture; this is
+  // the server safety net for pre-v1.0.15 captures.
+  if (_looksLikeNonCompanyOrg(p.currentOrganization)) {
+    Logger.log('[WebApp] _sanitize: non-company org detected ("' + p.currentOrganization + '") — blanked');
+    p.currentOrganization = '';
   }
+  if (_looksLikeNonCompanyOrg(p.organization)) {
+    Logger.log('[WebApp] _sanitize: non-company org detected ("' + p.organization + '") — blanked');
+    p.organization = '';
+  }
+
+  // 5b. REMOVED 2026-06-24 — server-side headline→organization derivation deleted.
+  //
+  // RCA (S. Roy "STAN" / Nikhil alma-mater / "ex-<Company>" class): the headline is
+  // marketing copy, and deriving a current employer from it is a recurring WRONG-ORG
+  // source. The current employer now comes ONLY from the APK's Experience-section
+  // "Present" read (org-from-headline was removed app-side in the same 2026-06-24
+  // patch). When organization is blank we now LEAVE it blank, so the lead PARKS at a
+  // review status (NEEDS_EMAIL / VERIFY) rather than being drafted to a guessed
+  // recipient — empty-the-server-can-flag beats a confidently-wrong tuple.
+  // _extractOrgFromHeadlineServer is hard-retired below in the same patch.
+  // (The _looksLikeNonCompanyOrg blank-guard above is RETAINED — it still strips a
+  // non-company org the APK might emit, e.g. an alma mater read in error.)
 
   // 6. Strip trailing connection-degree noise from text fields
   ['fullName','headline','currentDesignation','currentOrganization','designation','organization','location']
@@ -2828,7 +2923,42 @@ function _sanitizeIncomingPayload(data) {
  * @param {string} headline
  * @returns {string} extracted org name or ''
  */
+// 2026-06-22 (server intake guard, RCA wrong-org/headline-derived): blank a
+// currentOrganization that is NOT a real company — a motivational headline
+// tagline, a program/event, or an education institution (alma mater). The
+// pre-v1.0.15 APK headline-fallback emits these NON-EMPTY, so the legacy
+// _looksLikeHeadlineJunkOrg / OrgRepair guards pass them through; the email
+// engine then derives a junk domain (buildingteamsthatwin.com, jaipuria.ac.in,
+// girlscript.tech) and drafts a wrong recipient. Blanking parks the lead at
+// NEEDS_EMAIL instead. Conservative: a genuine corporate-form marker
+// (Ltd/Inc/Technologies/Enterprises/…) is a HARD negative override, and short
+// (<4-word) brand names with no education token are never touched.
+function _looksLikeNonCompanyOrg(orgStr) {
+  var s = ((orgStr || '') + '').trim();
+  if (!s) return false;
+  var lower = s.toLowerCase();
+  var words = s.split(/\s+/).filter(function (w) { return w.length > 0; });
+  // Negative override: a genuine corporate-form suffix means it IS a real company.
+  // (Deliberately excludes ambiguous tokens like 'institute'/'consulting'/'research'
+  // — those are exactly why the legacy guards let education/advisory orgs through.)
+  var corpMarker = /\b(inc|llc|ltd|limited|pvt|private|corp|corporation|gmbh|plc|company|technologies|labs|systems|solutions|industries|enterprises?|ventures|holdings|networks|software|motors|pharma|retail|digital|studios?|bank|media|airlines|telecom|infotech|consultancy)\b/i;
+  if (corpMarker.test(lower)) return false;
+  // (a) education / program tokens — an alma mater or program is NOT current employment.
+  var eduProgram = /(\bsummer of code\b|\binstitute of (management|technology|science|engineering)\b|\bschool of (management|business|law|engineering|design)\b|\bcollege\b|\buniversity\b|\bvishwavidyalaya\b|\bvidyalaya\b|\bmahavidyalaya\b|\bgurukul\b|\bpolytechnic\b|\bacademy\b)/i;
+  if (eduProgram.test(lower)) return true;
+  // (b) motivational-tagline shape: >=4 words with a tagline verb/pronoun, no corp marker.
+  var taglineVerb = /\b(building|helping|inspiring|hir(e|ing)|grow(ing)?|transform(ing)?|empower(ing)?|enabl(e|ing)|driv(e|ing)|creat(e|ing)|deliver(ing)?|making|we|your)\b/i;
+  if (words.length >= 4 && taglineVerb.test(lower)) return true;
+  return false;
+}
+
 function _extractOrgFromHeadlineServer(headline) {
+  // RETIRED 2026-06-24 — server-side headline→org derivation was a recurring wrong-org
+  // source (S. Roy "STAN" / alma-mater / "ex-<Company>" class). Hard-stubbed to ALWAYS
+  // return '' so it can never resurrect the behavior even if a stale caller reappears.
+  // The original parser body below is intentionally unreachable; pinned by a test.
+  return '';
+  /* eslint-disable no-unreachable */
   if (!headline) return '';
   var h = headline.toString().trim();
   if (h.length < 3) return '';
@@ -3267,6 +3397,28 @@ function _auditCapture_(payload, e, outcome) {
 // clicks), follow-up schedule, and a Gmail-deep-link to the thread. One
 // endpoint per use case so the client can paginate cheaply.
 
+// Build the best-available Gmail web deep link for a draft/thread.
+// ★RESEARCH 2026-06-24 (deep-research, 100 agents): the Gmail Android app has NO public
+// deep-link to a specific thread/message, and Android App Links STRIP the URL #fragment —
+// so the legacy "#inbox/<threadId>" URL lands on the Gmail INBOX HOME instead of the
+// conversation (the user's recurring complaint). The ONLY URL that reliably resolves to the
+// conversation is the rfc822msgid SEARCH URL, keyed by the true RFC-2822 Message-ID header
+// (NOT Gmail's internal hex thread-id); web Gmail renders the single matching result as the
+// conversation. We prefer it whenever the Message-ID is known (captured at draft time in
+// GmailDrafter, col W RFC822_MESSAGE_ID). The #inbox/<threadId> form is a last-resort fallback
+// for legacy rows that predate Message-ID capture. Angle brackets are stripped; the id is
+// URL-encoded (defensive, per a working community implementation).
+function _gmailThreadDeepLink_(rfc822MessageId, threadId) {
+  var msgid = (rfc822MessageId || '').toString().trim().replace(/^<|>$/g, '');
+  if (msgid) {
+    return 'https://mail.google.com/mail/u/0/#search/rfc822msgid:' + encodeURIComponent(msgid);
+  }
+  if (threadId) {
+    return 'https://mail.google.com/mail/u/0/#inbox/' + threadId;
+  }
+  return null;
+}
+
 function _handleLeadDashboardRequest(e) {
   if (!_checkAuthToken_(e)) {
     return ContentService.createTextOutput(JSON.stringify({
@@ -3412,7 +3564,8 @@ function _handleLeadDashboardRequest(e) {
         pipelineStatus: status,
         draftId: draftId,
         threadId: threadId,
-        gmailThreadUrl: threadId ? ('https://mail.google.com/mail/u/0/#inbox/' + threadId) : null,
+        gmailThreadUrl: _gmailThreadDeepLink_(
+          (c.RFC822_MESSAGE_ID ? (r[c.RFC822_MESSAGE_ID - 1] || '') : ''), threadId),
         tracking: {
           trackingId: track.trackingId || null,
           opens: track.opens,

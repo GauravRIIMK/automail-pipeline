@@ -8,7 +8,7 @@
 // ─── SPREADSHEET SETUP ──────────────────────────────────────
 var CONFIG = {
   // Sheet IDs and names
-  SHEET_ID: 'YOUR_GOOGLE_SHEET_ID',
+  SHEET_ID: '1ZMg0NychDnNqfD0DfVIqWZmzrGik5EFIdaaeJQWMsvY',
   DATA_SHEET: 'Sheet2',             // Main data sheet with lead list
   LOG_SHEET: 'PipelineLog',         // Log sheet for debugging
 
@@ -57,7 +57,7 @@ var CONFIG = {
   // _enrichmentFlag(name) which also honors ScriptProperties of the same name
   // (so you can promote WITHOUT a code push — set property ENRICHMENT_SORT_V2=1).
   ENRICHMENT_MX_V2: false,          // G3: distinguish transient DNS failure from genuine no-MX (don't -50 on timeout)
-  ENRICHMENT_SOURCETYPE_V2: false,  // G2: collapse apk_provided into 'pattern' type (closes A16 correlated-consensus)
+  ENRICHMENT_SOURCETYPE_V2: false,  // G2: VESTIGIAL since 2026-06-23 (F4). The apk->pattern collapse is now UNCONDITIONAL code in EmailSelector._sourceType (a ScriptProperty reset must not re-open A16), so this flag gates nothing. Setting it 0/1 has NO effect — left for back-compat with the admin endpoint + shadow tests.
   ENRICHMENT_SORT_V2: false,        // G1: score-first sort + verification-gated confidence floor + finalizer AND-rule
   ENRICHMENT_CLASSIFY_V2: false,    // G6: dynamic classification (FREE for freemail winner; roleAccount flag)
   ENRICHMENT_BOUNCE_V2: false,      // G4: per-address hard-reject + domain soft (no domain-level nuke); inert until G9 captures bounces
@@ -123,7 +123,13 @@ var CONFIG = {
   // burst (transient), not true daily exhaustion. The flag is then typed 'transient'
   // and auto-clears in GMAIL_TRANSIENT_CLEAR_MS (~3 min = one scanner tick) rather
   // than the full 60-min probe-through used for genuine daily exhaustion.
-  GMAIL_TRANSIENT_OPS_THRESHOLD: 15000, // ops/day below which quota error = transient
+  // ★RECALIBRATED -p6-gmail-reserve (2026-06-30): was 15000 (sized to the mythical
+  // ~20K pool). The real ceiling is ~3.8-4K, so at 15000 EVERY genuine daily
+  // exhaustion (~3800 ops) fell below the threshold → mis-typed 'transient' →
+  // flag auto-cleared in 3 min → leads flowed back, re-hit createDraft, and churned
+  // all day (gmailFlagSet read false despite real exhaustion). Now set BELOW the
+  // GMAIL_SCAN_TOTAL_BUDGET reserve (2200) so real exhaustion is durably flagged.
+  GMAIL_TRANSIENT_OPS_THRESHOLD: 1800,  // ops/day below which a quota error = transient
   GMAIL_TRANSIENT_CLEAR_MS: 180000,     // 3 min = one scanner tick (transient flag lifetime)
 
   // ─── AI MODELS ─────────────────────────────────────────────
@@ -363,7 +369,7 @@ var GAURAV_PROFILE = {
       'Quality Crisis Resolution: Cut complaint rate by 94% across 121K orders, closed 40% of quality gap in 2.5 weeks',
       'At Thoughtworks: Built AI-powered email system reducing drafting by 85%, managed 8 MarTech tools, achieved 25% APAC conversion lift and 30% CAC reduction',
       'At Blinkit Growth: GTM launch for 38 dark stores, doubled DAUs YoY growth rate to 15%, reduced marketing costs 40%',
-      'At upGrad: Built referral program from 0 to Rs 15Cr in 4 months with 100+ successful career transitions'
+      'At upGrad: Built referral program from 0 to Rs 1.5 Cr in 4 months with 100+ successful career transitions'
     ]
   },
   OPS_CONSULTING: {
@@ -445,7 +451,7 @@ var GAURAV_PROFILE = {
     // Line 2: Credibility — 3 brand-anchored numeric outcomes, AI tools UNNAMED
     // (Leadership §1 audit: "Drop the tool names; they mean nothing to Saumya")
     // Amended: tighter sentence rhythm, ~6 words saved
-    credibilityParagraph: 'Built upGrad\'s referral funnel from 0 to ₹15 Cr in 4 months. Ran ops ' +
+    credibilityParagraph: 'Built upGrad\'s referral funnel from 0 to ₹1.5 Cr in 4 months. Ran ops ' +
                           'for ~50 cloud kitchens at Blinkit Bistro across 4 cities, 30+ stakeholders. ' +
                           'Shipped 3 AI tools solo, automating sourcing, outreach and CRM.',
 
@@ -467,7 +473,7 @@ var GAURAV_PROFILE = {
     // Rendered between hook+credibility and bridge/ask for Leadership-archetype emails.
     // Each bullet: ≤18 words, metric-led, from verified profile. No TA/recruiting claims.
     experienceBullets: [
-      { label: 'upGrad',           body: 'Built referral funnel from 0 to ₹15 Cr in 4 months across 14 cross-functional teams.' },
+      { label: 'upGrad',           body: 'Built referral funnel from 0 to ₹1.5 Cr in 4 months across 14 cross-functional teams.' },
       { label: 'Blinkit Bistro',   body: 'Ran P&L for ~50 cloud kitchens, 4 cities; cut complaint rate 94% across 121K orders.' },
       { label: 'Great Learning',   body: 'Scaled B2B partnerships across 50+ countries; built international vertical from zero.' }
     ],
@@ -495,7 +501,7 @@ var GAURAV_PROFILE = {
 
     // 4 proof bullets (Recruiter §4 Rule 1) — order matters, AI bullet LAST
     bullets: [
-      'upGrad — built the 0-to-1 referral funnel to ₹15 Cr in 4 months.',
+      'upGrad — built the 0-to-1 referral funnel to ₹1.5 Cr in 4 months.',
       'Blinkit Bistro — ran ops for ~50 cloud kitchens across 4 cities, 30+ stakeholders.',
       'Great Learning — scaled B2B partnerships across 50+ countries; youngest department lead ' +
         'in the company\'s history.',
@@ -523,9 +529,9 @@ var GAURAV_PROFILE = {
     psFragment: 'Youngest department lead at Great Learning — scaled B2B partnerships across ' +
                 '50+ countries before turning 25.',
 
-    // Subject template: Recruiter §8 Pattern A (identity-led, 82 chars — mobile-safe)
+    // Subject template: Recruiter §8 Pattern A (identity-led, 83 chars — mobile-safe)
     // No {{company_name}} substitution — identity-led, not company-led
-    subjectTemplate: 'AI-native Growth & Strategy operator — ex-upGrad (₹15 Cr funnel) | Gaurav Rathore',
+    subjectTemplate: 'AI-native Growth & Strategy operator — ex-upGrad (₹1.5 Cr funnel) | Gaurav Rathore',
 
     // Signature: Recruiter §6 — multi-line (recruiters use IIM-K as anchor)
     signatureLine1: 'MBA, IIM Kozhikode | B.E., Thapar University',
@@ -571,16 +577,18 @@ var GAURAV_ACHIEVEMENT_BANK = {
   'thoughtworks_conversion':     { metrics: ['25', '30'],                                 aliases: ['apac conversion', 'conversion lift', 'cac reduction', 'lead scoring', 'b2b segmentation', '4x5x3x4'], role: 'Consultant', org: 'Thoughtworks' },
 
   // ── upGrad ──
-  'upgrad_referral':             { metrics: ['15', '100', '0', '4'],                      aliases: ['referral program', '15cr', '15 cr', '100+ career transitions', 'career transitions', 'from 0 to'], role: 'Growth Lead', org: 'upGrad' },
+  'upgrad_referral':             { metrics: ['1.5', '100', '0', '4'],                     aliases: ['referral program', '1.5cr', '1.5 cr', '100+ career transitions', 'career transitions', 'from 0 to'], role: 'Growth Lead', org: 'upGrad' },
 
   // ── Tech Stack / Tools (verified) ──
   'tools_stack':                 { metrics: [],                                            aliases: ['jasper ai', 'langchain', 'weaviate', 'dspy', 'python', 'sheets api', 'docs api', 'apps script', 'rag system', 'prompt engineering'], role: 'Cross-cutting', org: 'Cross-cutting' }
 };
 
 // All verified numbers/metrics across all roles (for quick "is this number real?" lookup)
+// '15' here is the Blinkit inventory SLA (10-15 min) and Blinkit DAU growth (15%) —
+// it is NOT the upGrad referral figure, which is 1.5 Cr. Do not remove '15'.
 var GAURAV_METRIC_WHITELIST = [
-  '50', '4', '13', '5.7', '68', '94', '121', '40', '2.5', '10', '15', '200', '35', '8', '30',
-  '38', '6', '800', '85', '25', '800k', '35k', '15cr', '68l', '5.7l', '121k',
+  '50', '4', '13', '1.5', '5.7', '68', '94', '121', '40', '2.5', '10', '15', '200', '35', '8', '30',
+  '38', '6', '800', '85', '25', '800k', '35k', '1.5cr', '68l', '5.7l', '121k',
   '0', '100', '4x5x3x4'
 ];
 

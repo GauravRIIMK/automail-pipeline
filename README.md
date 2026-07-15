@@ -159,7 +159,7 @@ Every surface has its own `README.md` with setup, architecture, and extension po
 
 | Surface | Tech | What it does | Source |
 |---|---|---|---|
-| **Android app** | Java, Accessibility Service, Gemini 2.5 Flash Vision, Apollo + RocketReach + Hunter | Watches LinkedIn app, screenshots profile, extracts structured data via vision, cross-validates emails through 3 enrichment APIs, posts to Apps Script Web App. | `android-app/` (architecture + APK release notes — source is proprietary) |
+| **Android app** | Java, Accessibility Service, Gemini 2.5 Flash Vision, Apollo + RocketReach + Hunter | Watches LinkedIn app, screenshots profile, extracts structured data via vision, cross-validates emails through 3 enrichment APIs, posts to Apps Script Web App. | `android-app/` (architecture write-up only — source and APK are not published) |
 | **Chrome extension** | Manifest V3, Gemini, Chrome Identity API, Google Sheets API v4 | Low-signature, user-initiated LinkedIn page extractor. Uses OAuth2 to write directly to Google Sheets. | [`chrome-extension/`](./chrome-extension) |
 | **Apps Script pipeline** | Google Apps Script V8, Gmail / Drive / Sheets API, Claude, Gemini | The outreach brain. Reads Sheet2, researches, composes, validates, drafts, and schedules follow-ups. | [`gmail-apps-script/`](./gmail-apps-script) |
 | **Gmail extractor** | Python 3.10+, Gmail API, spaCy NER | One-shot contact-graph extractor from your own sent box. Useful for bootstrapping the lead list. | [`gmail-extractor/`](./gmail-extractor) |
@@ -175,18 +175,21 @@ The three surfaces can run independently. Follow [docs/SETUP.md](./docs/SETUP.md
 3. **Add your keys** via the sheet menu (`AutoMail Pipeline → Setup → Set API Keys`) — Claude + Gemini. They are stored in Script Properties, not in code.
 4. **Deploy the Apps Script as a Web App** (Execute as: Me, Access: Anyone) to get the `/exec` URL your capture surfaces will POST to.
 5. **Chrome extension:** `chrome://extensions → Load unpacked → chrome-extension/`, then paste your OAuth client ID in `manifest.json` and the Web App URL in the popup settings.
-6. **Android app:** download the APK from the [android-app/](./android-app) release notes, install, grant Accessibility permission, paste the Web App URL in settings.
+6. **Android app:** the APK is not distributed publicly and its source is not in this repo — see [android-app/](./android-app) for the architecture write-up. The pipeline runs fine without it; the Chrome extension and a manual sheet row are both valid capture paths.
 
 ---
 
 ## 6. Everything that has been masked
 
-This repo is a clean export — no real secrets are committed. Every one of the following has been replaced with a placeholder:
+Every credential in this repo is a placeholder — no live secret exists anywhere in the current tree. The table below is the complete list of what you must supply yourself; each is read from Script Properties at runtime, never from source.
 
 | Placeholder | Meaning | Where to get it |
 |---|---|---|
 | `YOUR_CLAUDE_API_KEY` | Anthropic Claude API key | https://console.anthropic.com |
 | `YOUR_GEMINI_API_KEY` | Google AI Studio Gemini key | https://aistudio.google.com |
+| `YOUR_HUNTER_API_KEY` | Hunter.io email-finder key | https://hunter.io |
+| `YOUR_REOON_API_KEY` | Reoon email-verifier key | https://emailverifier.reoon.com |
+| `YOUR_ZEROBOUNCE_API_KEY` | ZeroBounce verifier key (legacy — extension only) | https://zerobounce.net |
 | `YOUR_GOOGLE_SHEET_ID` | Target Sheet ID (from Sheet URL after `/d/`) | Sheets UI |
 | `YOUR_OAUTH_CLIENT_ID` | OAuth 2.0 Desktop / Chrome client ID | GCP Console → APIs & Services → Credentials |
 | `YOUR_OAUTH_CLIENT_SECRET` | OAuth 2.0 client secret | same |
@@ -235,9 +238,9 @@ Cold outreach runs unattended for weeks, so the hard part isn't the happy path �
 - **Lock-serialized writes.** Triggers can fire concurrently, so every sheet mutation passes through a script lock — two runs can never clobber the same row (a lost-update race that would otherwise silently drop leads).
 - **Quota-aware drafting.** Before spending a single AI token, the pipeline checks the Gmail draft quota; if it's exhausted it parks the lead (`PENDING_QUOTA_RESET`) and retries after the midnight reset — no wasted tokens, no burned retries.
 - **Capture audit trail.** Every inbound capture — accepted *or* rejected — is logged, so a lead that never appears can be diagnosed in seconds instead of vanishing without a trace.
-- **Current-employer reconciliation.** People update their LinkedIn headline before their experience section, so the captured "current company" can be stale. When the headline names a different employer than the captured org, the headline wins — preventing an email addressed to the wrong company.
+- **Current-employer integrity.** Naming the wrong employer is the most visible failure this system can have, so the rule is deliberately narrow: the employer comes *only* from the Experience entry whose date range reads "Present". An earlier version inferred it from the LinkedIn headline instead — that proved unreliable in production and was retired at every layer rather than patched. When a third-party enrichment source disagrees with what was actually read from the profile, the profile wins and the draft is flagged for human review; a disagreement is never resolved silently.
 - **Append-only intake guard.** The raw-capture sheet is defended against a subtle Google Sheets trap — a stray filter silently turns row-appends into no-ops — that can otherwise freeze *all* new intake with no error at all.
-- **~550 automated tests.** A self-contained suite (run from the sheet menu or an admin endpoint) covers composition rules, classification, email selection, the state machine, and every fix above — so changes can't silently regress behaviour.
+- **671 automated tests.** A self-contained suite (run from the sheet menu or an admin endpoint) covers composition rules, classification, email selection, the state machine, and every fix above — so changes can't silently regress behaviour.
 
 ---
 

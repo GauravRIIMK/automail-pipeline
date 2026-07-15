@@ -1369,6 +1369,282 @@ test('vendorHealth_overrides_local_tracker_when_drifted', ['vendorHealth', 'regr
     'Circuit state is the authoritative pre-flight signal, NOT the tracker.');
 });
 
+// ─── VENDOR FAILOVER WIRING (-p5-vendorfailover) ───────────────────────────
+// Apollo↔Hunter exhaustion-driven failover: the VendorHealth breaker is now
+// wired into resolveLeadApolloMatch + the two Hunter call sites via the gated
+// vendorFailoverShouldSkip / vendorFailoverRecord adapters.
+
+// 1. Kill-switch precedence: VENDOR_FAILOVER_ENABLED='0' must FORCE no-skip even
+//    when the circuit is OPEN (revert-without-redeploy). Default (unset) = ON.
+test('vendorFailover_shouldSkip_honors_killswitch', ['vendorFailover', 'vendorHealth', 'regression'], function() {
+  if (typeof vendorFailoverShouldSkip !== 'function') {
+    assertTrue(false, 'vendorFailoverShouldSkip not in scope — VendorHealth.gs not deployed?');
+  }
+  // Half A — kill-switch OFF ('0'): OPEN apollo circuit must NOT be skipped.
+  _buildVhSvcEnv({ nowMs: 1747920000000, initialProps: { VENDOR_FAILOVER_ENABLED: '0' } });
+  vendorHealthRecordResult('apollo', 403, 'forbidden');  // open the circuit
+  assertTrue(vendorHealthShouldSkip('apollo'),
+    'precondition: raw breaker says skip when circuit OPEN');
+  assertFalse(vendorFailoverShouldSkip('apollo'),
+    'kill-switch VENDOR_FAILOVER_ENABLED=0 must FORCE shouldSkip=false even when OPEN');
+
+  // Half B — flag unset (default ON): OPEN apollo circuit MUST be skipped.
+  _buildVhSvcEnv({ nowMs: 1747920000000, initialProps: {} });  // fresh env, flag unset
+  vendorHealthRecordResult('apollo', 403, 'forbidden');
+  assertTrue(vendorFailoverShouldSkip('apollo'),
+    'failover default ON: OPEN apollo circuit must be skipped so the cascade falls to Hunter');
+});
+
+// 2. Wiring assertions (source-introspection per harness finding #14): the
+//    three live call sites must pre-flight skip + record on the right breaker.
+test('vendorFailover_wired_into_apollo_and_hunter_sites', ['vendorFailover', 'wiring', 'regression'], function() {
+  assertTrue(typeof resolveLeadApolloMatch === 'function', 'resolveLeadApolloMatch in scope');
+  var apolloSrc = resolveLeadApolloMatch.toString();
+  assertTrue(apolloSrc.indexOf("vendorFailoverShouldSkip('apollo')") >= 0,
+    'resolveLeadApolloMatch must pre-flight skip on the apollo circuit');
+  assertTrue(apolloSrc.indexOf("vendorFailoverRecord('apollo'") >= 0,
+    'resolveLeadApolloMatch must record the apollo call outcome (so 403/429 trips the breaker)');
+
+  assertTrue(typeof _hunterEmailFinder === 'function', '_hunterEmailFinder in scope');
+  var hfSrc = _hunterEmailFinder.toString();
+  assertTrue(hfSrc.indexOf("vendorFailoverShouldSkip('hunter')") >= 0,
+    '_hunterEmailFinder must pre-flight skip on the hunter circuit');
+  assertTrue(hfSrc.indexOf("vendorFailoverRecord('hunter'") >= 0,
+    '_hunterEmailFinder must record the hunter call outcome');
+
+  assertTrue(typeof fetchHunterPattern === 'function', 'fetchHunterPattern in scope');
+  var hpSrc = fetchHunterPattern.toString();
+  assertTrue(hpSrc.indexOf("vendorFailoverShouldSkip('hunter')") >= 0,
+    'fetchHunterPattern must pre-flight skip on the hunter circuit');
+  assertTrue(hpSrc.indexOf("vendorFailoverRecord('hunter'") >= 0,
+    'fetchHunterPattern must record the hunter call outcome');
+});
+
+// 3. Recording adapter must NEVER throw into the enrichment hot path, whatever
+//    junk it is handed (null code, object body, etc.).
+test('vendorFailoverRecord_never_throws', ['vendorFailover', 'regression'], function() {
+  if (typeof vendorFailoverRecord !== 'function') {
+    assertTrue(false, 'vendorFailoverRecord not in scope');
+  }
+  _buildVhSvcEnv();
+  var threw = false;
+  try {
+    vendorFailoverRecord('apollo', 403, 'forbidden');
+    vendorFailoverRecord('hunter', null, null);
+    vendorFailoverRecord('hunter', 200, { not: 'a string' });
+  } catch (e) { threw = true; }
+  assertFalse(threw, 'vendorFailoverRecord must never throw — breaker bookkeeping is best-effort');
+});
+
+// 4. Diagnostics smoke: the account-check + manual-reset helpers exist and
+//    validate input without throwing.
+test('vendor_account_diagnostics_in_scope', ['vendorFailover', 'diagnostic'], function() {
+  assertTrue(typeof menuCheckVendorAccounts === 'function', 'menuCheckVendorAccounts must be defined');
+  assertTrue(typeof menuResetVendorBreaker === 'function', 'menuResetVendorBreaker must be defined');
+  var r = menuResetVendorBreaker('');
+  assertEqual(r.status, 'error', 'empty provider must return {status:error}, not throw');
+});
+
+// 5. Auto-recovery (behavioral): a productive 200 recorded while the circuit is
+//    OPEN must transition it back to HEALTHY so Apollo resumes as primary — this
+//    is the self-heal the "use Hunter while Apollo recovers" design relies on,
+//    and it pins the review fix (success recorded only on a productive 200).
+test('vendorFailover_record_200_recovers_open_circuit', ['vendorFailover', 'vendorHealth', 'regression'], function() {
+  if (typeof vendorFailoverRecord !== 'function') {
+    assertTrue(false, 'vendorFailoverRecord not in scope');
+  }
+  var env = _buildVhSvcEnv({ nowMs: 1747920000000, initialProps: {} });
+  // Open the apollo circuit (exhaustion 403).
+  vendorFailoverRecord('apollo', 403, 'payment required');
+  assertTrue(vendorFailoverShouldSkip('apollo'),
+    'precondition: OPEN apollo circuit must be skipped by failover');
+  // Cool-down elapses (apollo = 30 min) → next live call is a HALF_OPEN probe.
+  env.advanceClockMs(31 * 60 * 1000);
+  // A productive 200 (real person) recovers the circuit and stops skipping.
+  vendorFailoverRecord('apollo', 200, '');
+  assertFalse(vendorFailoverShouldSkip('apollo'),
+    'a productive 200 must recover the circuit so Apollo resumes as primary');
+  assertEqual(vendorHealthGetState('apollo').state, 'HEALTHY',
+    'circuit must be HEALTHY after the recovery 200');
+});
+
+// 6. Apollo signals exhaustion as HTTP 422 "insufficient credits" (NOT 401/402/403/429).
+//    Its body must be recognized as a quota signal so the circuit OPENs (→ skip Apollo,
+//    fail over to Hunter) instead of only DEGRADING (which never skips). Live data
+//    2026-06-30 showed 695 consecutive Apollo 422s that never opened the breaker.
+test('vendorHealth_apollo_422_insufficient_credits_opens', ['vendorFailover', 'vendorHealth', 'regression'], function() {
+  _buildVhSvcEnv();
+  var r = vendorHealthRecordResult('apollo', 422,
+    '{"error":"You have insufficient credits! Upgrade your plan to increase your number of lead credits"}');
+  assertEqual(r.state, 'OPEN',
+    'Apollo 422 + "insufficient credits" must OPEN the circuit (quota signal), not just DEGRADE');
+  // Control: a 422 with a genuine validation body (no credit signal) must NOT open the circuit.
+  _buildVhSvcEnv();
+  var r2 = vendorHealthRecordResult('apollo', 422, '{"error":"invalid linkedin_url format"}');
+  assertTrue(r2.state !== 'OPEN',
+    'a 422 validation error (no credit signal) must NOT open the circuit — stays transient');
+});
+
+// ─── ACCURACY LEDGER (-p6-accuracy-ledger) ─────────────────────────────────
+// The ground-truth feedback loop: STATUS outcome × EMAIL_SOURCE → accuracy rates.
+
+test('accuracy_ledger_bucket_classifies_outcomes', ['accuracyLedger', 'regression'], function() {
+  if (typeof _ledgerBucketOf_ !== 'function') {
+    assertTrue(false, '_ledgerBucketOf_ not in scope — DiagnosticHelper.gs not deployed?');
+  }
+  assertEqual(_ledgerBucketOf_('RESPONDED'), 'replied', 'RESPONDED → replied');
+  assertEqual(_ledgerBucketOf_('REPLIED'), 'replied', 'legacy REPLIED → replied');
+  assertEqual(_ledgerBucketOf_('BOUNCED_NO_SUCH_USER'), 'bounced', 'BOUNCED_<cat> → bounced');
+  assertEqual(_ledgerBucketOf_('DRAFT_DELETED'), 'deleted', 'DRAFT_DELETED → deleted (human reject)');
+  assertEqual(_ledgerBucketOf_('SENT'), 'sent', 'SENT → sent');
+  assertEqual(_ledgerBucketOf_('FOLLOWUP_2'), 'sent', 'FOLLOWUP_* → sent');
+  assertEqual(_ledgerBucketOf_('DRAFT_CREATED'), 'drafted', 'DRAFT_CREATED → drafted (in-flight)');
+  assertEqual(_ledgerBucketOf_('NEW'), 'other', 'pre-draft NEW → other (excluded from rates)');
+  assertEqual(_ledgerBucketOf_('ERROR'), 'other', 'ERROR → other');
+});
+
+test('accuracy_ledger_rates_math', ['accuracyLedger', 'regression'], function() {
+  if (typeof _ledgerRates_ !== 'function') {
+    assertTrue(false, '_ledgerRates_ not in scope');
+  }
+  // 7 sent + 2 replied + 1 bounced = 10 mailed; 5 deleted → 15 reviewed.
+  var r = _ledgerRates_({ sent: 7, replied: 2, bounced: 1, deleted: 5, drafted: 9, other: 3 });
+  assertEqual(r.mailed, 10, 'mailed = sent + replied + bounced (replied/bounced were sent)');
+  assertEqual(r.bounceRate, 0.1, 'bounceRate = 1/10');
+  assertEqual(r.replyRate, 0.2, 'replyRate = 2/10');
+  assertEqual(r.deleteRate, 0.333, 'deleteRate = 5/(10+5) = manual reject rate over reviewed drafts');
+  // No mailed → null rates (avoid divide-by-zero noise).
+  var z = _ledgerRates_({ sent: 0, replied: 0, bounced: 0, deleted: 0, drafted: 4 });
+  assertEqual(z.bounceRate, null, 'no mailed → bounceRate null');
+  assertEqual(z.deleteRate, null, 'no reviewed → deleteRate null');
+});
+
+test('accuracy_ledger_in_scope', ['accuracyLedger', 'diagnostic'], function() {
+  assertTrue(typeof menuAccuracyLedger === 'function', 'menuAccuracyLedger must be defined');
+  assertTrue(typeof _ledgerConfBand_ === 'function', '_ledgerConfBand_ must be defined');
+  assertEqual(_ledgerConfBand_(0.9), '0.85+', 'verified band');
+  assertEqual(_ledgerConfBand_(0.2), '0.20-0.34', 'constructed band');
+  assertEqual(_ledgerConfBand_(''), '(none)', 'blank confidence → (none)');
+});
+
+// ─── GMAIL SCAN-RESERVE RECALIBRATION (-p6-gmail-reserve) ───────────────────
+// Root cause of "no new drafts": the syncer + reply scanners self-budgeted
+// INDEPENDENTLY against a phantom ~20K/day pool; the real GAS Gmail ceiling is
+// ~3.8-4K, so their combined budget (4500) exhausted quota → createDraft failed.
+
+test('gmail_scan_reserve_exceeded_pure', ['gmailReserve', 'regression'], function() {
+  if (typeof _gmScanReserveExceeded_ !== 'function') {
+    assertTrue(false, '_gmScanReserveExceeded_ not in scope — GmailDraftSyncer.gs not deployed?');
+  }
+  assertTrue(_gmScanReserveExceeded_(2200, 2200), 'total at cap → scanners yield');
+  assertTrue(_gmScanReserveExceeded_(3000, 2200), 'total over cap → scanners yield');
+  assertFalse(_gmScanReserveExceeded_(2100, 2200), 'total under cap → do NOT yield');
+  assertFalse(_gmScanReserveExceeded_(0, 2200), 'zero ops → do NOT yield');
+  assertFalse(_gmScanReserveExceeded_(9999, 0), 'invalid cap (0) → do NOT yield (fail-open)');
+});
+
+test('gmail_scan_reserve_wired_and_recalibrated', ['gmailReserve', 'wiring', 'regression'], function() {
+  // The global reserve must exist and be consulted by the reply scanner (and,
+  // by the same pattern, the syncer) BEFORE its per-tag budget.
+  assertTrue(typeof _gmScanReserveShouldYield === 'function', '_gmScanReserveShouldYield must be defined');
+  assertTrue(typeof processReplies === 'function', 'processReplies in scope');
+  assertTrue(processReplies.toString().indexOf('_gmScanReserveShouldYield') >= 0,
+    'processReplies must consult the global scan-reserve before scanning');
+
+  // Constants recalibrated to the OBSERVED ceiling, not the 20K myth:
+  assertTrue(CONFIG.GMAIL_TRANSIENT_OPS_THRESHOLD <= 2000,
+    'transient threshold must sit below the ~3.8K ceiling (was 15000) so real exhaustion is durably flagged');
+  assertTrue((SYNCER_DAILY_GMAIL_OP_BUDGET + REPLY_DAILY_GMAIL_OP_BUDGET) <= 2200,
+    'combined scanner budgets must stay under the global reserve so drafts keep headroom');
+});
+
+// ─── 5f. EDU-INSTITUTION / ALMA-MATER GUARD (-p6-edu-guard) ─────────────────
+// Server-side backstop for the recurring "school captured as current employer"
+// bug (Nikhil = Jaipuria Institute of Management). Two detectors + wiring.
+
+test('edu_guard_email_domain_detector', ['eduGuard', 'regression'], function() {
+  assertTrue(typeof _emailDomainIsAcademic_ === 'function', '_emailDomainIsAcademic_ in scope');
+  // Academic mailboxes → held.
+  assertTrue(_emailDomainIsAcademic_('nikhil@jaipuria.ac.in'), '.ac.in is academic');
+  assertTrue(_emailDomainIsAcademic_('a.b@mit.edu'), '.edu is academic');
+  assertTrue(_emailDomainIsAcademic_('x@iimb.ac.in'), 'iimb.ac.in is academic');
+  assertTrue(_emailDomainIsAcademic_('y@student.rmit.edu.au'), '.edu.au is academic');
+  assertTrue(_emailDomainIsAcademic_('z@dtu.ac.uk'), '.ac.uk is academic');
+  // Real corporate / provider domains → NOT held (these are the ones we DRAFT to).
+  assertFalse(_emailDomainIsAcademic_('nikhil@emeritus.org'), 'emeritus.org is corporate');
+  assertFalse(_emailDomainIsAcademic_('a@mesaschool.co'), 'school-NAMED company domain is NOT academic');
+  assertFalse(_emailDomainIsAcademic_('a@amazon.com'), 'amazon.com is corporate');
+  assertFalse(_emailDomainIsAcademic_('a@academy.com'), '"academy" substring must not false-match');
+  assertFalse(_emailDomainIsAcademic_(''), 'empty → false');
+  assertFalse(_emailDomainIsAcademic_('not-an-email'), 'no @ → false');
+});
+
+test('edu_guard_org_text_detector', ['eduGuard', 'regression'], function() {
+  assertTrue(typeof _orgTextLooksAcademic_ === 'function', '_orgTextLooksAcademic_ in scope');
+  // Alma-mater-style org strings → flag [VERIFY].
+  assertTrue(_orgTextLooksAcademic_('Jaipuria Institute of Management'), 'institute of management');
+  assertTrue(_orgTextLooksAcademic_('Delhi University'), 'university');
+  assertTrue(_orgTextLooksAcademic_('IIM Kozhikode'), 'IIM token');
+  assertTrue(_orgTextLooksAcademic_('IIT Bombay'), 'IIT token');
+  assertTrue(_orgTextLooksAcademic_('Government Polytechnic, Pune'), 'polytechnic');
+  // Real employers (incl. school-NAMED companies) → NOT flagged.
+  assertFalse(_orgTextLooksAcademic_('Emeritus'), 'edtech company is not academic');
+  assertFalse(_orgTextLooksAcademic_('Mesa School of Business'), 'school-NAMED company must NOT match (no bare "school of")');
+  assertFalse(_orgTextLooksAcademic_('Amazon'), 'Amazon not academic');
+  assertFalse(_orgTextLooksAcademic_('Great Learning'), '"Learning" must not false-match');
+  assertFalse(_orgTextLooksAcademic_(''), 'empty → false');
+});
+
+test('edu_guard_wired_into_finalize', ['eduGuard', 'wiring', 'regression'], function() {
+  assertTrue(typeof _finalize === 'function', '_finalize in scope');
+  var src = _finalize.toString();
+  assertTrue(src.indexOf('EDU_ORG_GUARD_ENABLED') >= 0,
+    '_finalize must honor the EDU_ORG_GUARD_ENABLED kill-switch');
+  assertTrue(src.indexOf('_emailDomainIsAcademic_') >= 0 && src.indexOf('_orgTextLooksAcademic_') >= 0,
+    '_finalize must consult BOTH edu detectors');
+  assertTrue(src.indexOf('alma_mater_email_held') >= 0 && src.indexOf('verify_recipient_before_send') >= 0,
+    '_finalize must hold academic-domain emails and flag [VERIFY]');
+});
+
+// ─── 5f2. STABLE-IDENTITY FOLLOW-UP DEDUP (-p7-followup-identity) ───────────
+// The "2 follow-up threads for one lead" bug: dedup keyed on mutable EMAIL, so a
+// re-enrich/correction (Samriddhi Wishlink→Lendbox) scheduled a 2nd set under a
+// new email key and both fired. Fix: key on stable ParentRow.
+
+test('followup_identity_key_prefers_parentrow', ['followupIdentity', 'regression'], function() {
+  assertTrue(typeof _fuIdentityKey_ === 'function', '_fuIdentityKey_ in scope');
+  // Same lead (ParentRow 356), two different emails → SAME identity key (collapses).
+  var kA = _fuIdentityKey_(356, 'samriddhi.gupta@wishlink.com');
+  var kB = _fuIdentityKey_(356, 'samriddhi.gupta@lendbox.in');
+  assertEqual(kA, kB, 'same ParentRow → same identity regardless of email drift');
+  assertEqual(kA, 'row:356', 'identity is ParentRow-based when present');
+  // No ParentRow → falls back to email identity.
+  assertEqual(_fuIdentityKey_('', 'x@y.com'), 'email:x@y.com', 'falls back to email when no ParentRow');
+  assertEqual(_fuIdentityKey_(0, 'X@Y.com'), 'email:x@y.com', 'email identity is lowercased');
+});
+
+test('followup_fallback_body_detector', ['followupIdentity', 'regression'], function() {
+  assertTrue(typeof _fuBodyLooksLikeFallback_ === 'function', '_fuBodyLooksLikeFallback_ in scope');
+  assertTrue(_fuBodyLooksLikeFallback_('...I tightened 13 ops variables across 121K orders...'), 'detects stage-1 fallback');
+  assertTrue(_fuBodyLooksLikeFallback_('reduced a 40% ops quality gap to near-zero in 2.5 weeks'), 'detects stage-2 fallback');
+  assertTrue(_fuBodyLooksLikeFallback_('Last note from me — I know the inbox gets loud'), 'detects stage-3 fallback');
+  assertFalse(_fuBodyLooksLikeFallback_('Hi Roohneet, saw Google Cloud shipped Vertex AI updates...'), 'real personalized body is NOT a fallback');
+  assertFalse(_fuBodyLooksLikeFallback_(''), 'empty → not fallback');
+});
+
+test('followup_dedup_and_recompose_wired', ['followupIdentity', 'wiring', 'regression'], function() {
+  // Write-time dedup (BatchProcessor) must key on the stable identity helper.
+  assertTrue(typeof _persistFollowUps === 'function', '_persistFollowUps in scope');
+  assertContains(_persistFollowUps.toString(), '_fuIdentityKey_',
+    '_persistFollowUps must dedup on ParentRow identity, not raw email');
+  // Process-time gate + lazy re-compose (FollowUp) must be wired.
+  assertTrue(typeof processScheduledFollowUps === 'function', 'processScheduledFollowUps in scope');
+  var ps = processScheduledFollowUps.toString();
+  assertContains(ps, '_fuIdentityKey_', 'one-per-run gate + group dedup must key on stable identity');
+  assertContains(ps, '_fuBodyLooksLikeFallback_', 'must detect frozen-fallback bodies at fire time');
+  assertContains(ps, '_fuRecomposeStageBody_', 'must re-compose a frozen fallback body at fire time');
+});
+
 // ─── 5e. PHASE 2 AMEND — HARNESS ISOLATION TEST (Section 2.3) ───────────────
 //
 // Harness-integrity test: catches "mock pollution between tests" bugs before
@@ -2332,7 +2608,7 @@ test('tier3_hr_subject_pattern_a', ['cxotier3', 'enrich', 'regression'], functio
   var result = _composeDeterministicFallback_HR(lead, FIXTURES.sampleDossier,
     { template: 'HR_RECRUITER' }, FIXTURES.sampleResumeSelection);
   assertMatches(result.subjectLine,
-    /AI-native Growth & Strategy operator.*ex-upGrad.*₹15 Cr.*Gaurav Rathore/,
+    /AI-native Growth & Strategy operator.*ex-upGrad.*₹1.5 Cr.*Gaurav Rathore/,
     'HR subject MUST match Pattern A (identity-led, brand anchor, headline metric)');
   // Mobile-safe: under 85 chars
   assertTrue(result.subjectLine.length <= 90,
@@ -5330,23 +5606,23 @@ test('eq3_scorer_3plus_hard_bounces_hard_rejects_watchitem9', ['eq3', 'selector'
   });
 });
 
-test('eq3_sourceType_apk_and_pattern_are_DISTINCT_watchitem2', ['eq3', 'selector', 'consensus', 'watchlist', 'A16'], function() {
-  // ── CLASS-B INVERTED at `-eq8-content-fix-amend` (2026-06-11) ─────────────
-  // ORIGINAL: locked the unflagged legacy behavior (apk distinct from pattern).
-  // INVERTED because: G2 was PROMOTED live via ScriptProperty
-  // (ENRICHMENT_SOURCETYPE_V2=1, set_enrichment_flag, 2026-06-11 12:44 IST) —
-  // and the resolver honors ScriptProperty over CONFIG by design, so the
-  // unflagged assertion now reflects deployment state, not code. LESSON
-  // (harness rule): flag-dependent tests must PIN flags via the override —
-  // never assert unpinned behavior that a promotion can flip.
+test('eq3_sourceType_apk_collapses_to_pattern_unconditionally', ['eq3', 'selector', 'consensus', 'watchlist', 'A16'], function() {
+  // ── F4 (2026-06-23 email-core): apk->pattern collapse is now UNCONDITIONAL ──
+  // History: this test was CLASS-B-INVERTED at -eq8 to pin BOTH flag states (the
+  // flag-OFF half asserted the legacy "apk distinct" A16 defect, preserved for
+  // rollback). The 2026-06-23 forensic baseline showed the A16 false-diversity-2
+  // VERIFIED-no-[VERIFY] ship is a top high-confidence-bounce risk, AND that leaving
+  // the safe behavior gated on the G2 ScriptProperty meant a property reset would
+  // silently re-open the hole. F4 made the collapse a CODE DEFAULT — so apk MUST
+  // collapse to 'pattern' regardless of the flag. Pinned BOTH ways to prove it.
   if (typeof _sourceType !== 'function') { assertTrue(false, '_sourceType not in scope'); }
   _eq7WithFlags({ ENRICHMENT_SOURCETYPE_V2: false }, function() {
-    assertEqual(_sourceType('apk_provided'), 'apk',
-      'flag OFF (pinned) → legacy: apk distinct from pattern (the A16 defect, preserved for rollback)');
+    assertEqual(_sourceType('apk_provided'), 'pattern',
+      'flag OFF → apk STILL collapses to pattern (F4: unconditional; the A16 rollback path is closed)');
   });
   _eq7WithFlags({ ENRICHMENT_SOURCETYPE_V2: true }, function() {
     assertEqual(_sourceType('apk_provided'), 'pattern',
-      'flag ON (pinned) → apk collapses into pattern (A16 closed; live behavior since promotion)');
+      'flag ON → apk collapses into pattern (apk + a same-address pattern guess = 1 correlated type)');
   });
   assertEqual(_sourceType('pattern_first_last'), 'pattern', 'pattern_first_last → pattern (flag-independent)');
 });
@@ -5457,15 +5733,17 @@ test('eq7_flag_resolver_override_then_config', ['eq7', 'enrichment', 'flags'], f
   });
 });
 
-test('eq7_g2_sourcetype_collapses_apk_when_flag_on', ['eq7', 'g2', 'A16'], function() {
-  // AMENDED `-eq8-content-fix-amend`: off-half now PINNED via override (the
-  // unpinned assert broke when G2 was promoted via ScriptProperty).
+test('eq7_g2_sourcetype_collapses_apk_unconditionally', ['eq7', 'g2', 'A16'], function() {
+  // F4 (2026-06-23 email-core): apk->pattern is a CODE DEFAULT now, no longer gated
+  // on G2. BOTH flag states must collapse apk into pattern (closes A16 correlated
+  // consensus regardless of ScriptProperty state — a reset can no longer re-open it).
   _eq7WithFlags({ ENRICHMENT_SOURCETYPE_V2: false }, function() {
-    assertEqual(_sourceType('apk_provided'), 'apk', 'flag OFF (pinned) → apk stays distinct (legacy)');
+    assertEqual(_sourceType('apk_provided'), 'pattern',
+      'flag OFF → apk STILL collapses to pattern (F4 unconditional; no rollback to the A16 defect)');
   });
   _eq7WithFlags({ ENRICHMENT_SOURCETYPE_V2: true }, function() {
     assertEqual(_sourceType('apk_provided'), 'pattern',
-      'G2 flag ON → apk collapses to pattern (apk+pattern = 1 type, closes A16 correlated consensus)');
+      'flag ON → apk collapses to pattern (apk+pattern = 1 type)');
   });
 });
 
@@ -5572,6 +5850,482 @@ test('eq7_all_v2_flags_default_false_in_config', ['eq7', 'safety', 'config'], fu
   assertFalse(!!CONFIG.ENRICHMENT_SORT_V2, 'ENRICHMENT_SORT_V2 must ship false');
   assertFalse(!!CONFIG.ENRICHMENT_CLASSIFY_V2, 'ENRICHMENT_CLASSIFY_V2 must ship false');
   assertFalse(!!CONFIG.ENRICHMENT_BOUNCE_V2, 'ENRICHMENT_BOUNCE_V2 must ship false');
+});
+
+// ─── G3/G7 bounce-suppression hardening (2026-06-22) ────────────────────────
+test('g3_per_address_hard_bounce_suppressed_even_flag_off', ['g3', 'bounce', 'regression'], function() {
+  var sig = _eq3EmptySignals(); sig.mxByDomain['x.com'] = true;
+  sig.hardBounceByAddress = { 'bounced@x.com': 1 };
+  var cand = _eq3Candidate('bounced@x.com', [{ name: 'apollo_verified', weight: 42 }]);
+  _eq7WithFlags({ ENRICHMENT_BOUNCE_V2: false }, function() {
+    var r = _scoreCandidate(cand, { firstName: 'B', lastName: 'C' }, sig);
+    assertTrue(r.hardRejected === true,
+      'G3: an exact previously-hard-bounced address is suppressed even with the domain flag OFF (additive, always-on)');
+  });
+});
+test('g3_bounce_store_wiring_present', ['g3', 'bounce', 'regression'], function() {
+  assertTrue(typeof getBouncedAddressesMap === 'function', 'getBouncedAddressesMap helper must be defined');
+  assertContains(_markLeadRowBounced.toString(), '_recordBouncedAddress',
+    'G3: _markLeadRowBounced must record the exact bounced address to the durable store');
+  assertContains(_gatherSignals.toString(), 'getBouncedAddressesMap',
+    'G3: _gatherSignals must populate hardBounceByAddress from the durable store');
+});
+test('g7_psv_hard_bounce_reads_authoritative_sheet', ['g7', 'bounce', 'regression'], function() {
+  assertContains(_psvGetHardBounceCount.toString(), 'getBouncedDomainsSnapshot',
+    'G7: _psvGetHardBounceCount must read the BouncedDomains sheet, not the legacy top-50 property cache');
+});
+
+// ─── server org-intake guard (2026-06-22, RCA wrong-org headline-derived) ───
+test('non_company_org_guard_blanks_taglines_education_programs', ['org_guard', 'regression'], function() {
+  assertTrue(typeof _looksLikeNonCompanyOrg === 'function', '_looksLikeNonCompanyOrg must be defined');
+  // MUST blank (non-company → lead parks at NEEDS_EMAIL, never emailed at a junk domain):
+  assertTrue(_looksLikeNonCompanyOrg('Jaipuria Institute of Management'), 'education institute → non-company');
+  assertTrue(_looksLikeNonCompanyOrg('GirlScript Summer of Code'), 'program/event → non-company');
+  assertTrue(_looksLikeNonCompanyOrg('Building Teams That Win'), 'headline tagline → non-company');
+  assertTrue(_looksLikeNonCompanyOrg('Delhi University'), 'university → non-company');
+  // MUST pass through (real companies, never blanked):
+  assertFalse(_looksLikeNonCompanyOrg('Stripe'), 'Stripe is a company');
+  assertFalse(_looksLikeNonCompanyOrg('Tata CLIQ'), 'Tata CLIQ is a company');
+  assertFalse(_looksLikeNonCompanyOrg('Jio'), 'Jio is a company');
+  assertFalse(_looksLikeNonCompanyOrg('Everest Group'), 'Everest Group is a company');
+  assertFalse(_looksLikeNonCompanyOrg('upGrad Enterprise'), 'EdTech company w/ Enterprise marker');
+  assertFalse(_looksLikeNonCompanyOrg('Reliance Industries'), 'Industries marker → company');
+  assertFalse(_looksLikeNonCompanyOrg('The House of Abhinandan Lodha'), 'real 5-word company name, no tagline verb');
+  assertFalse(_looksLikeNonCompanyOrg('Shri Ram Consulting and Research Centre'), 'real consulting firm — out of this guard scope (multiple-Present is app-side)');
+});
+test('non_company_org_guard_wired_into_sanitize', ['org_guard', 'regression'], function() {
+  assertContains(_sanitizeIncomingPayload.toString(), '_looksLikeNonCompanyOrg',
+    'intake _sanitizeIncomingPayload must invoke _looksLikeNonCompanyOrg to blank tagline/education/program orgs');
+});
+
+test('non_company_org_blanked_in_processing_path', ['org_guard', 'regression'], function() {
+  var src = _processOneLead.toString();
+  assertContains(src, '_looksLikeNonCompanyOrg', '_processOneLead must guard a non-company org on re-process');
+  assertContains(src, 'NON_COMPANY_ORG', 'the non-company blank note marker must be present');
+});
+
+test('a2_apollo_employer_crosscheck_wired', ['org_guard', 'apollo', 'regression'], function() {
+  var src = _processOneLead.toString();
+  assertContains(src, 'apolloCurrentOrg', 'Stage 6.95 must stash + read lead.apolloCurrentOrg (Apollo current employer)');
+  assertContains(src, 'APOLLO_EMPLOYER_MISMATCH_ADVISORY', 'Stage 6.95 must annotate the Apollo employer mismatch');
+  assertContains(src, 'org_recipient_mismatch', 'Apollo cross-check must raise org_recipient_mismatch (drives [VERIFY]); flag-only, never mutate org/email');
+  assertContains(src, 'APOLLO_EMPLOYER_CROSSCHECK_ENABLED', 'Stage 6.95 must carry a kill-switch');
+});
+test('followup_pins_sender_and_recipient_employers_no_swap', ['followup', 'regression'], function() {
+  var src = _composeFollowUp.toString();
+  assertContains(src, '<sender>', 'follow-up prompt must pin the SENDER (Gaurav) employer so it cannot be swapped with the recipient');
+  assertContains(src, 'never swap', 'follow-up prompt must explicitly forbid swapping sender/recipient employers');
+});
+
+// ─── email-core accuracy increment 1 (2026-06-23, F2/F3/F4) ─────────────────
+// Forensic baseline (58 confirmed-wrong bounces) surfaced: (F4) apk+pattern of the
+// SAME address manufacturing a false diversity-2 VERIFIED-no-[VERIFY] ship; (F2) the
+// three org-mismatch seams using divergent overlap definitions; (F3) catch-all /
+// unknown sheet+apollo addresses shipping at conf 0.90 with no operator-visible flag.
+test('f4_apk_collapses_to_pattern_type_unconditionally', ['enrichment', 'fusion', 'regression'], function() {
+  assertTrue(typeof _sourceType === 'function', '_sourceType must be defined');
+  // apk (DOM-scraped) + a pattern guess of the SAME address are CORRELATED, not
+  // independent — they must be ONE diversity type so they cannot manufacture a
+  // false diversity-2 boost (the A16 class). This must hold REGARDLESS of the
+  // ENRICHMENT_SOURCETYPE_V2 ScriptProperty (now a code default), so a property
+  // reset can no longer silently re-open the hole.
+  assertEqual(_sourceType('apk_provided'), 'pattern', 'apk_provided must collapse to the pattern type');
+  assertEqual(_sourceType('pattern_first_last'), 'pattern', 'pattern_* stays pattern');
+  // genuinely-independent sources stay distinct so REAL corroboration still boosts:
+  assertEqual(_sourceType('apollo_verified'), 'apollo', 'apollo stays its own type (apk+apollo still earns diversity)');
+  assertEqual(_sourceType('hunter_finder'), 'hunter', 'hunter stays its own type');
+  // (flag-independence of the apk->pattern collapse is pinned by
+  // eq3_sourceType_apk_collapses_to_pattern_unconditionally — both flag states.)
+});
+
+test('f2_stage69_org_mismatch_uses_shared_substring_helper', ['org_guard', 'enrichment', 'regression'], function() {
+  // The finalizer org-domain GATE, the Stage-6.9 advisory, and the Stage-6.95 Apollo
+  // cross-check must share ONE substring-containment overlap definition. Stage 6.9
+  // previously used exact token equality, diverging from the gate (it false-flagged
+  // org "Proofpoint" vs domain "proofpointinc.com" that the gate treats as a match).
+  assertTrue(typeof _orgTokenOverlapSubstr === 'function', 'shared overlap helper must exist');
+  assertTrue(_orgTokenOverlapSubstr(['proofpoint'], ['proofpointinc']),
+    'substring containment must count as overlap (no false mismatch on proofpoint/proofpointinc)');
+  assertFalse(_orgTokenOverlapSubstr(['proofpoint'], ['puma']),
+    'genuinely-unrelated tokens must count as a mismatch');
+  // wiring: Stage 6.9 in _processOneLead must delegate to the shared helper
+  assertContains(_processOneLead.toString(), '_orgTokenOverlapSubstr(_orgTokens, _domainTokens)',
+    'Stage 6.9 must call the shared substring helper so all three org-mismatch seams stay in sync');
+});
+
+test('f3_psv_failure_flags_verify_recipient_and_subject_prefix', ['drafter', 'deliverability', 'regression'], function() {
+  assertTrue(typeof createDraft === 'function', 'createDraft must be defined');
+  var src = createDraft.toString();
+  // On a PSV failure (blocker, or composite below PSV_THRESHOLD — e.g. catch-all
+  // ~43) createDraft must raise verify_recipient_before_send so the non-deletable
+  // [VERIFY] subject prefix fires; closes the gap where catch-all/unknown sheet +
+  // apollo addresses shipped at conf 0.90 with NO operator-visible flag.
+  assertContains(src, "lead.riskFlags.push('verify_recipient_before_send')",
+    'PSV failure must add verify_recipient_before_send (drives the [VERIFY] subject prefix)');
+  assertContains(src, "'[VERIFY] ' + subjectLine",
+    'createDraft must prepend the non-deletable [VERIFY] subject prefix');
+  // the prefix decision must be computed from lead.riskFlags too (PSV writes there),
+  // not only the pre-PSV metadata snapshot
+  assertContains(src, '(lead && lead.riskFlags)',
+    'the [VERIFY] decision must union lead.riskFlags (post-PSV), not read metadata alone');
+});
+
+// ─── mutation-kill closures (2026-06-23, from the increment-1 adversarial pass) ───
+// The adversarial verification found 3 starred/important mutations with no killing
+// test. These close them so the suite goes RED if the mutation is applied.
+test('mut1_emailconfidence_column_distinct_from_scrape_confidence', ['enrichment', 'schema', 'mutation'], function() {
+  // STARRED mutation (1): emailConfidence (Sheet2 col Z=26, 0.0-1.0 deliverability) must
+  // never be confused with the APK SCRAPE confidence (Sheet1 col L=12, 0-100 profile
+  // scrape). They live in DIFFERENT sheets; a column swap corrupts the [VERIFY]/abstain math.
+  assertEqual(CONFIG.COLUMNS.EMAIL_CONFIDENCE, 26, 'emailConfidence = Sheet2 col Z (26)');
+  assertEqual(CONFIG.SHEET1_COLUMNS.CONFIDENCE, 12, 'APK scrape confidence = Sheet1 col L (12)');
+  assertTrue(CONFIG.COLUMNS.EMAIL_CONFIDENCE !== CONFIG.SHEET1_COLUMNS.CONFIDENCE,
+    'the two confidence columns must remain distinct');
+  // pin the 0-1 derivation so a swap to the 0-100 scrape field breaks the suite
+  assertContains(selectBestEmail.toString(), 'winner.score / 100',
+    'emailConfidence must be derived as winner.score/100 (0-1 scale), never the 0-100 scrape field');
+});
+
+test('mut2_catch_all_not_scored_as_safe', ['enrichment', 'scorer', 'deliverability', 'mutation'], function() {
+  // STARRED mutation (2): a catch-all domain ACCEPTS every address — it is NOT verification.
+  // If catch_all were scored as 'safe' (+20), confidence would inflate on an unverifiable mailbox.
+  if (typeof _scoreCandidate !== 'function') { assertTrue(false, '_scoreCandidate not in scope'); }
+  var cand = _eq3Candidate('a@x.com', [{ name: 'apollo_verified', weight: 42 }]);
+  var sigCA = _eq3EmptySignals(); sigCA.reoonByEmail['a@x.com'] = { status: 'catch_all' };
+  var rCA = _scoreCandidate(cand, { firstName: 'A', lastName: 'B' }, sigCA);
+  assertTrue(_eq3ReasonsHave(rCA, 'reoon_catch_all +3'), 'catch_all must score +3 (suspect), not safe');
+  assertFalse(_eq3ReasonsHave(rCA, 'reoon_safe'), 'catch_all must NEVER be scored as reoon_safe');
+  var sigSafe = _eq3EmptySignals(); sigSafe.reoonByEmail['a@x.com'] = { status: 'safe' };
+  var rSafe = _scoreCandidate(cand, { firstName: 'A', lastName: 'B' }, sigSafe);
+  assertTrue(_eq3ReasonsHave(rSafe, 'reoon_safe +20'), 'a genuine safe verdict scores +20 (contrast)');
+});
+
+test('mut6_source_weights_priors_pinned', ['enrichment', 'scorer', 'mutation'], function() {
+  // Mutation (6) source-prior half: SOURCE_WEIGHTS had no test, so a silent change would
+  // shift every gather-path score. Pin the anchors + the ordering invariant.
+  if (typeof SOURCE_WEIGHTS === 'undefined') { assertTrue(false, 'SOURCE_WEIGHTS not in scope'); }
+  assertEqual(SOURCE_WEIGHTS.apollo_verified, 42, 'apollo_verified prior');
+  assertEqual(SOURCE_WEIGHTS.hunter_finder, 32, 'hunter_finder prior');
+  assertEqual(SOURCE_WEIGHTS.pattern_first_last, 14, 'pattern_first_last prior');
+  assertEqual(SOURCE_WEIGHTS.apk_provided, 4, 'apk_provided is the LOWEST prior (often a personal email)');
+  assertTrue(SOURCE_WEIGHTS.apollo_verified > SOURCE_WEIGHTS.hunter_finder, 'apollo_verified > hunter_finder');
+  assertTrue(SOURCE_WEIGHTS.hunter_finder > SOURCE_WEIGHTS.pattern_first_last, 'hunter > pattern');
+  assertTrue(SOURCE_WEIGHTS.pattern_first_last > SOURCE_WEIGHTS.apk_provided, 'pattern > apk');
+});
+
+test('f4_apk_hunter_pattern_triple_collapses_to_two_types', ['enrichment', 'fusion', 'A16', 'regression'], function() {
+  // Adversarial-review gap: apk + hunter + pattern at the SAME address must count as TWO
+  // independent diversity types ({apk,pattern} + hunter), not three — apk is correlated with
+  // the pattern guess. (The confidence floor then drops 0.80->0.65: safer, more scrutiny.)
+  assertEqual(_sourceType('apk_provided'), _sourceType('pattern_first_last'),
+    'apk and pattern collapse to one type (correlated) → a triple counts as 2 types, not 3');
+  assertTrue(_sourceType('hunter_finder') !== _sourceType('apk_provided'),
+    'hunter is genuinely independent of apk/pattern — it keeps the second type');
+});
+
+// ─── email-core increment 3 (2026-06-23, F5 disagreement + calibration instrumentation) ───
+test('f5_disagreement_advisory_wired', ['enrichment', 'selector', 'regression'], function() {
+  // §6 disagreement-aware: a strong runner-up at a DIFFERENT domain must surface as a flag
+  // that drives [VERIFY] (the additive scorer never lowers the winner for a conflicting alt).
+  var src = _processOneLead.toString();
+  assertContains(src, 'EMAIL_DISAGREEMENT_ADVISORY',
+    'Stage 6.96 must raise the disagreement advisory when a strong runner-up sits at a different domain');
+  assertContains(src, "'email_disagreement'",
+    'disagreement must push the email_disagreement riskFlag (flag-only; never mutates email/org)');
+  assertContains(src, 'runnerUps',
+    'Stage 6.96 must read the selector runnerUps');
+  // the [VERIFY] subject prefix must honor email_disagreement
+  assertContains(createDraft.toString(), "indexOf('email_disagreement')",
+    'the [VERIFY] subject prefix must fire on an email_disagreement flag');
+});
+
+test('instrumentation_provenance_logged_for_calibration', ['enrichment', 'instrumentation', 'regression'], function() {
+  // The 2026-06-23 baseline could not measure calibration (no per-lead candidate set
+  // persisted; bounce table lacked the Reoon verdict). This pins the capture that fixes that.
+  var src = _processOneLead.toString();
+  assertContains(src, "'PROVENANCE'",
+    'finalize must emit an append-only PROVENANCE event for future calibration analysis');
+  assertContains(src, 'candidates=[',
+    'PROVENANCE must capture the candidate set (so candidate-RECALL becomes measurable)');
+  assertContains(src, "reoon=' + _winnerReoon",
+    'the FINALIZER note + PROVENANCE must persist the chosen email Reoon verdict (bucket bounce-rate by verdict)');
+});
+
+// ─── email-core increment 4 (2026-06-23, gated auto-resolve: flag→fix / fewer flags) ───
+test('phaseA_corroborated_catchall_suppresses_verify_flag', ['drafter', 'deliverability', 'regression'], function() {
+  var src = createDraft.toString();
+  // A catch-all/unknown PSV-fail (NO hard blocker) on a verified-tier (corroborated)
+  // address must NOT raise [VERIFY] — SMTP can't confirm a catch-all mailbox, so confidence
+  // rests on source agreement. The dangerous wrong-DOMAIN case is still caught by the
+  // org-mismatch path. Hard blockers (invalid/disabled/spamtrap) are NEVER suppressed.
+  assertContains(src, '_corroboratedCatchAll',
+    'createDraft must compute a corroborated-catch-all suppression for the catch-all [VERIFY] flag');
+  assertContains(src, "lead.selectionTier === 'verified'",
+    'corroboration is proxied by the selector verified tier (conf>=0.55)');
+  assertContains(src, '_psvBlockerPresent',
+    'hard blockers must never be suppressed (only no-blocker catch-all/unknown is)');
+});
+
+test('phaseB_disagreement_suppressed_when_winner_org_consistent', ['enrichment', 'selector', 'regression'], function() {
+  var src = _processOneLead.toString();
+  // Disagreement must flag ONLY when the winner is NOT org-consistent. A benign runner-up
+  // losing to the org-correct winner must not flag (org-anchor decreases noise).
+  assertContains(src, '_dgWinnerOrgConsistent',
+    'Stage 6.96 must gate the disagreement flag on the winner being org-consistent (org-anchor)');
+  assertContains(src, 'disagreement BENIGN',
+    'an org-consistent winner must be logged benign and NOT flagged');
+});
+
+test('phaseC_org_anchor_shadow_logs_proposal_not_switch', ['enrichment', 'org_guard', 'shadow', 'regression'], function() {
+  var src = _processOneLead.toString();
+  // Phase C ships SHADOW-FIRST: on a mismatch + trustworthy org it resolves the org domain
+  // (same resolver as a live switch), constructs the proposed corrected address, and LOGS it
+  // — but must NOT switch the recipient. Gated by ORG_ANCHOR_SHADOW; junk orgs excluded.
+  assertContains(src, 'ORG_ANCHOR_SHADOW',
+    'Stage 6.97 must emit an ORG_ANCHOR_SHADOW proposal log (gated by the ScriptProperty)');
+  assertContains(src, 'resolveDomainContextual(_oaOrg',
+    'shadow must resolve the org domain with the SAME resolver a live switch would use');
+  assertContains(src, 'wouldSwitch=true',
+    'shadow must RECORD the proposed correction it WOULD make (without switching the recipient)');
+  assertContains(src, '_oaJunk',
+    'shadow must exclude junk / non-company orgs from proposals');
+});
+
+test('all_templates_have_identity_wall_no_function_mirror', ['composer', 'identity', 'regression'], function() {
+  if (typeof _buildSystemPrompt !== 'function') { assertTrue(false, '_buildSystemPrompt not in scope'); }
+  // The Suma failure: the STANDARD path MIRRORED the recipient's "talent acquisition" function
+  // onto Gaurav (framed his growth/ops work as talent-pipeline work). All three templates must
+  // carry the identity wall forbidding that. (HR already had it; STANDARD + CXO were the gap.)
+  var std = _buildSystemPrompt('STANDARD', 'professional');
+  var hr  = _buildSystemPrompt('HR_PARTNERSHIP', 'professional');
+  var cxo = _buildSystemPrompt('CXO_SHORT', 'professional');
+  assertContains(std, 'IDENTITY WALL', 'STANDARD prompt must carry the identity wall');
+  assertContains(cxo, 'IDENTITY WALL', 'CXO prompt must carry the identity wall');
+  assertContains(hr,  'IDENTITY WALL', 'HR prompt retains its identity wall');
+  assertTrue(/talent acquisition/i.test(std) && /transferable/i.test(std),
+    'STANDARD wall must forbid attributing talent-acquisition to Gaurav and require transferable-skill bridging');
+  assertTrue(/relabel an ambiguous/i.test(std),
+    'STANDARD wall must forbid relabeling an ambiguous recipient title into a specialized function');
+});
+
+test('archetype_override_forces_hr_routing', ['classifier', 'archetype', 'regression'], function() {
+  if (typeof classifyLead !== 'function') { assertTrue(false, 'classifyLead not in scope'); }
+  if (typeof menuSetArchetypeOverride !== 'function') { assertTrue(false, 'menuSetArchetypeOverride not in scope'); }
+  // A human can pin an ambiguous-title lead's archetype (Suma "Campus & Alternate Channels"
+  // is really campus recruiting / HR). classifyLead must consult ARCHETYPE_OVERRIDES and
+  // force lead.isHR so the EXISTING HR routing applies — no scraped-data corruption.
+  var cl = classifyLead.toString();
+  assertContains(cl, 'ARCHETYPE_OVERRIDES', 'classifyLead must read the ARCHETYPE_OVERRIDES property');
+  assertContains(cl, 'lead.isHR = true', 'an HR override must force lead.isHR so the existing HR routing applies');
+  // setter persists + is reversible
+  var s = menuSetArchetypeOverride.toString();
+  assertContains(s, 'ARCHETYPE_OVERRIDES', 'setter must persist the override to ARCHETYPE_OVERRIDES');
+  assertContains(s, 'delete map', 'setter must support clearing an override (CLEAR/NONE)');
+});
+
+test('constructed_tier_pure_guess_parks_not_drafts', ['enrichment', 'deliverability', 'regression'], function() {
+  var src = _processOneLead.toString();
+  // A 'constructed' email is a fabricated-pattern guess (conf ~0.20, no captured email, no
+  // provider hit) — it bounces on non-catch-all domains (Vedang: vedang.tarare@scalerailabs.com
+  // -> 550). It must PARK at VERIFY_EMAIL, never auto-draft/send. Real-but-unverified candidates
+  // (low_confidence / best_of_available) still draft+flag under no-hold.
+  assertContains(src, 'CONSTRUCTED_TIER_PARK_ENABLED',
+    '_processOneLead must gate the constructed-tier park on its kill-switch (reversible)');
+  assertContains(src, "finalized.tier === 'constructed'",
+    'the park must target ONLY the constructed (fabricated-guess) tier');
+  assertContains(src, 'EMAIL_UNVERIFIED_CONSTRUCTED',
+    'a parked constructed guess must carry the constructed-unverified note + VERIFY_EMAIL status');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ACCURACY INCREMENT 2026-06-24: (#1) confirmed-pattern reuse + self-learning,
+// (#2) pre-finalize Reoon deliverability probe + (#2b) gate-bypass-on-safe.
+// Pure helpers are tested behaviorally; the finalizer wiring is source-anchored
+// (GAS can't monkey-patch the bare global verifyEmailDeliverable — see finding #14).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test('pattern_apply_maps_all_canonical_tokens', ['enrichment', 'pattern', 'regression'], function() {
+  if (typeof _applyEmailPattern !== 'function') { assertTrue(false, '_applyEmailPattern not in scope'); return; }
+  var fn = 'john', ln = 'doe', d = 'acme.com';
+  assertTrue(_applyEmailPattern('{first}.{last}', fn, ln, d) === 'john.doe@acme.com', '{first}.{last}');
+  assertTrue(_applyEmailPattern('{f}{last}',      fn, ln, d) === 'jdoe@acme.com',     '{f}{last}');
+  assertTrue(_applyEmailPattern('{first}{last}',  fn, ln, d) === 'johndoe@acme.com',  '{first}{last}');
+  assertTrue(_applyEmailPattern('{first}_{last}', fn, ln, d) === 'john_doe@acme.com', '{first}_{last}');
+  assertTrue(_applyEmailPattern('{first}.{l}',    fn, ln, d) === 'john.d@acme.com',   '{first}.{l}');
+  assertTrue(_applyEmailPattern('{last}.{first}', fn, ln, d) === 'doe.john@acme.com', '{last}.{first}');
+  assertTrue(_applyEmailPattern('{f}.{last}',     fn, ln, d) === 'j.doe@acme.com',    '{f}.{last}');
+  assertTrue(_applyEmailPattern('{last}{f}',      fn, ln, d) === 'doej@acme.com',     '{last}{f}');
+  assertTrue(_applyEmailPattern('{first}',        fn, ln, d) === 'john@acme.com',     '{first}');
+  // Unknown token → '' so the caller falls back to its own default.
+  assertTrue(_applyEmailPattern('{weird}', fn, ln, d) === '', 'unknown token must return empty');
+  // No first name or no domain → ''.
+  assertTrue(_applyEmailPattern('{first}.{last}', '', ln, d) === '', 'no firstName → empty');
+  assertTrue(_applyEmailPattern('{first}.{last}', fn, ln, '') === '', 'no domain → empty');
+});
+
+test('pattern_apply_handles_missing_lastname', ['enrichment', 'pattern', 'regression'], function() {
+  if (typeof _applyEmailPattern !== 'function') { assertTrue(false, '_applyEmailPattern not in scope'); return; }
+  // With no last name, last-name-bearing patterns degrade to first-only (not 'john.@d').
+  assertTrue(_applyEmailPattern('{first}.{last}', 'john', '', 'x.com') === 'john@x.com', 'first.last w/o last → first only');
+  assertTrue(_applyEmailPattern('{f}{last}',      'john', '', 'x.com') === 'john@x.com', 'f+last w/o last → first only');
+});
+
+test('pattern_infer_recognizes_known_patterns', ['enrichment', 'pattern', 'regression'], function() {
+  if (typeof _inferEmailPattern_ !== 'function') { assertTrue(false, '_inferEmailPattern_ not in scope'); return; }
+  assertTrue(_inferEmailPattern_('john.doe@x.com', 'John', 'Doe') === '{first}.{last}', 'john.doe');
+  assertTrue(_inferEmailPattern_('jdoe@x.com',     'John', 'Doe') === '{f}{last}',      'jdoe');
+  assertTrue(_inferEmailPattern_('johndoe@x.com',  'John', 'Doe') === '{first}{last}',  'johndoe');
+  assertTrue(_inferEmailPattern_('doe.john@x.com', 'John', 'Doe') === '{last}.{first}', 'doe.john');
+  assertTrue(_inferEmailPattern_('john@x.com',     'John', 'Doe') === '{first}',        'john');
+});
+
+test('pattern_infer_returns_null_for_unrecognized', ['enrichment', 'pattern', 'regression'], function() {
+  if (typeof _inferEmailPattern_ !== 'function') { assertTrue(false, '_inferEmailPattern_ not in scope'); return; }
+  // Nicknames / initials-only / random local-parts must NOT be learned (would pollute the map).
+  assertTrue(_inferEmailPattern_('johnny@x.com', 'John', 'Doe') === null, 'nickname johnny → null');
+  assertTrue(_inferEmailPattern_('jd@x.com',     'John', 'Doe') === null, 'initials jd → null');
+  assertTrue(_inferEmailPattern_('xyz987@x.com', 'John', 'Doe') === null, 'random → null');
+  assertTrue(_inferEmailPattern_('john.doe@x.com', '',   'Doe') === null, 'no firstName → null');
+});
+
+test('pattern_reuse_wired_into_construct_fallback', ['enrichment', 'pattern', 'regression'], function() {
+  if (typeof _constructFromPrimitives !== 'function') { assertTrue(false, '_constructFromPrimitives not in scope'); return; }
+  var src = _constructFromPrimitives.toString();
+  assertContains(src, 'DOMAIN_PATTERN_REUSE_ENABLED', 'pattern reuse must be kill-switchable');
+  assertContains(src, '_applyEmailPattern', 'constructed tier must apply the known pattern');
+  // LOOKUP-ONLY: must NOT trigger live discovery in this hot fallback path.
+  assertContains(src, 'discoverDomainPattern(domain, true)', 'must call discoverDomainPattern in lookup-only mode');
+});
+
+test('pattern_discover_lookuponly_skips_live_discovery', ['enrichment', 'pattern', 'regression'], function() {
+  if (typeof discoverDomainPattern !== 'function') { assertTrue(false, 'discoverDomainPattern not in scope'); return; }
+  var src = discoverDomainPattern.toString();
+  assertContains(src, 'lookupOnly', 'discoverDomainPattern must accept a lookupOnly param');
+  assertContains(src, 'if (lookupOnly) return null', 'lookupOnly must short-circuit BEFORE live ensemble discovery');
+  // Ordering: the lookupOnly guard must come before _ddpdLiveDiscover.
+  assertTrue(src.indexOf('if (lookupOnly) return null') < src.indexOf('_ddpdLiveDiscover'),
+    'lookupOnly guard must precede _ddpdLiveDiscover so it never spends Hunter/Gemini quota');
+});
+
+test('pattern_self_observed_ground_truth_protected', ['enrichment', 'pattern', 'regression'], function() {
+  if (typeof discoverDomainPattern !== 'function' || typeof _ddpdSaveToSheet !== 'function') {
+    assertTrue(false, 'DDPD functions not in scope'); return;
+  }
+  // Non-expiring: a self_observed cached entry is returned regardless of TTL.
+  var dSrc = discoverDomainPattern.toString();
+  assertContains(dSrc, 'self_observed', 'discoverDomainPattern must special-case self_observed');
+  assertContains(dSrc, "tier = 'self_observed'", 'self_observed entry returns its own tier label (non-expiring path)');
+  // Overwrite-protected: a web guess must not clobber a self_observed row.
+  var sSrc = _ddpdSaveToSheet.toString();
+  assertContains(sSrc, '_incomingIsSelf', '_ddpdSaveToSheet must check whether the incoming write is self_observed');
+  assertContains(sSrc, 'preserving self_observed', 'a non-self_observed write must refuse to overwrite ground truth');
+});
+
+test('pattern_learn_hook_only_on_ground_truth', ['enrichment', 'pattern', 'regression'], function() {
+  if (typeof _finalize !== 'function') { assertTrue(false, '_finalize not in scope'); return; }
+  var src = _finalize.toString();
+  assertContains(src, 'DOMAIN_PATTERN_LEARN_ENABLED', 'self-learning must be kill-switchable');
+  assertContains(src, '_recordObservedPattern_', '_finalize must call the pattern recorder on ground truth');
+  // GROUND TRUTH = Reoon 'safe' ONLY (adversarial-review @286). user_verified is NO LONGER a
+  // learn trigger (human locks can be stale/bounced — Aditi/Samriddhi); catch_all/role excluded.
+  assertContains(src, "var _groundTruth = (payload.reoonStatus === 'safe')",
+    'learn gate must be Reoon-safe ONLY (not user_verified, not catch_all/role_account)');
+  assertContains(src, 'FREE_EMAIL_DOMAINS', 'freemail domains must be excluded from learning');
+  // Recorder itself must be dedup-guarded and skip unrecognized local-parts.
+  if (typeof _recordObservedPattern_ === 'function') {
+    var rSrc = _recordObservedPattern_.toString();
+    assertContains(rSrc, 'OBSPAT_', 'recorder must dedup-guard via a per-domain cache key');
+    assertContains(rSrc, 'if (!pat) return false', 'recorder must skip unrecognized local-parts');
+  }
+  // L5: a digit in the local-part = personal disambiguation, NOT a company pattern → not learned.
+  if (typeof _inferEmailPattern_ === 'function') {
+    assertTrue(_inferEmailPattern_('john.doe2@x.com', 'John', 'Doe') === null, 'digit suffix → null (not learned)');
+    assertTrue(_inferEmailPattern_('rkumar7@x.com', 'Raj', 'Kumar') === null, 'digit suffix → null (not learned)');
+  }
+});
+
+test('constructed_probe_wired_and_elevates', ['enrichment', 'deliverability', 'pattern', 'regression'], function() {
+  if (typeof finalizeEmailSelection !== 'function') { assertTrue(false, 'finalizeEmailSelection not in scope'); return; }
+  var src = finalizeEmailSelection.toString();
+  assertContains(src, '_probeConstructedEmail_', 'constructed branch must probe deliverability before finalize');
+  // Reoon-safe elevates the constructed guess out of the 0.20 tier.
+  assertContains(src, "_cStatus === 'safe'", 'a safe verdict must be detected');
+  assertContains(src, "_cTier = 'low_confidence'", 'safe/role_account must elevate to low_confidence');
+  assertContains(src, "_cStatus === 'catch_all'", 'catch_all must be detected');
+  assertContains(src, 'best_of_available', 'catch_all must map to best_of_available (won\'t bounce, unconfirmable)');
+});
+
+test('constructed_probe_gate_bypass_only_on_safe', ['enrichment', 'deliverability', 'regression'], function() {
+  if (typeof finalizeEmailSelection !== 'function') { assertTrue(false, 'finalizeEmailSelection not in scope'); return; }
+  var src = finalizeEmailSelection.toString();
+  assertContains(src, 'ORG_DOMAIN_GATE_BYPASS', 'a Reoon-safe verdict must be able to override the org-token gate');
+  // The bypass condition is gated specifically on 'safe' (NOT catch_all/unknown).
+  assertContains(src, "_gateRejected && _cStatus === 'safe'", 'gate bypass must require BOTH a rejection AND a safe verdict');
+});
+
+test('constructed_probe_helper_skipped_means_not_probed', ['enrichment', 'deliverability', 'regression'], function() {
+  if (typeof _probeConstructedEmail_ !== 'function') { assertTrue(false, '_probeConstructedEmail_ not in scope'); return; }
+  var src = _probeConstructedEmail_.toString();
+  assertContains(src, 'CONSTRUCTED_PROBE_ENABLED', 'probe must be kill-switchable');
+  assertContains(src, "=== 'skipped'", 'a skipped Reoon verdict (no key / breaker / quota)...');
+  assertContains(src, 'not_probed', '...must translate to not_probed so pre-probe behavior is unchanged');
+  // Behavioral: empty input is guarded BEFORE any flag/verifier read → always not_probed.
+  var r = _probeConstructedEmail_('');
+  assertTrue(r && r.status === 'not_probed', 'empty email → not_probed (no API call)');
+});
+
+// ── Adversarial-review @286 hardening: gate-bypass guards + pattern-trust threshold ──
+
+test('constructed_bypass_excludes_apollo_direct', ['enrichment', 'deliverability', 'regression'], function() {
+  if (typeof finalizeEmailSelection !== 'function') { assertTrue(false, 'finalizeEmailSelection not in scope'); return; }
+  var src = finalizeEmailSelection.toString();
+  // HIGH fix: an Apollo-direct address that already failed the gate at Tier 0/1/2 must NOT be
+  // re-rescued by the safe-bypass (S.Roy: s.roy@getstan.app is live but org=Unacademy).
+  assertContains(src, '_isApolloDirect', 'bypass must detect apollo_people_match_direct emails');
+  assertContains(src, "constructed.method.indexOf('apollo')", 'apollo-direct detection keys on the method string');
+  assertContains(src, '!_isApolloDirect', 'bypass condition must EXCLUDE apollo-direct addresses');
+  // Also: an uncertain org (orgArbVerify) means the DOMAIN is the unreliable step → no bypass.
+  assertContains(src, 'lead.orgArbVerify !== true', 'bypass must NOT fire when org itself is flagged uncertain');
+});
+
+test('constructed_bypass_flags_org_recipient_mismatch', ['enrichment', 'deliverability', 'regression'], function() {
+  if (typeof finalizeEmailSelection !== 'function' || typeof _finalize !== 'function') {
+    assertTrue(false, 'finalizer functions not in scope'); return;
+  }
+  var fSrc = finalizeEmailSelection.toString();
+  // When the bypass fires, the draft must carry explicit flags so [VERIFY] has a visible reason.
+  assertContains(fSrc, '_bypassedGate', 'bypass must track whether it fired');
+  assertContains(fSrc, 'org_gate_bypassed_by_reoon_safe', 'bypassed draft must carry the bypass flag');
+  assertContains(fSrc, 'org_recipient_mismatch', 'bypassed draft must carry org_recipient_mismatch ([VERIFY] reason)');
+  // _finalize must MERGE extra risk flags additively (not drop base tier flags).
+  var finSrc = _finalize.toString();
+  assertContains(finSrc, 'extraRiskFlags', '_finalize must merge payload.extraRiskFlags');
+});
+
+test('pattern_reuse_trusts_only_corroborated_patterns', ['enrichment', 'pattern', 'regression'], function() {
+  if (typeof _constructFromPrimitives !== 'function') { assertTrue(false, '_constructFromPrimitives not in scope'); return; }
+  var src = _constructFromPrimitives.toString();
+  // M8 fix: a single-source Gemini guess (cached 0.62) must NOT beat {first}.{last}. Only
+  // curated / self_observed / >=0.70-corroborated patterns are trusted.
+  assertContains(src, "_dp.tier === 'curated'", 'curated patterns are trusted');
+  assertContains(src, "'self_observed'", 'self_observed ground truth is trusted');
+  assertContains(src, '0.70', 'dynamic patterns require >=0.70 (excludes single-source 0.62)');
+});
+
+test('operator_candidate_email_kept_unverified_with_verify_flag', ['enrichment', 'deliverability', 'regression'], function() {
+  if (typeof menuSetCandidateEmail !== 'function') { assertTrue(false, 'menuSetCandidateEmail not in scope'); }
+  if (typeof _candidateEmailGet_ !== 'function') { assertTrue(false, '_candidateEmailGet_ not in scope'); }
+  // An operator-supplied TENTATIVE email is used as recipient but kept UNVERIFIED +
+  // [VERIFY]-flagged — never a clean verified/blind-send draft, never parked as constructed.
+  var src = _processOneLead.toString();
+  assertContains(src, '_candidateEmailGet_', '_processOneLead must apply an operator candidate email');
+  assertContains(src, 'OPERATOR_CANDIDATE', 'candidate path must annotate OPERATOR_CANDIDATE');
+  assertContains(src, "'operator_candidate'", 'candidate email source must be operator_candidate');
+  assertContains(src, "finalized.tier = 'low_confidence'",
+    'candidate must be low_confidence (not verified -> Phase A keeps the flag; not constructed -> park skipped)');
+  var s = menuSetCandidateEmail.toString();
+  assertContains(s, 'CANDIDATE_EMAILS', 'setter must persist to CANDIDATE_EMAILS');
+  assertContains(s, 'delete m', 'setter must support clearing (CLEAR/NONE/empty)');
 });
 
 // ─── G9 bounce-capture fix + remote-execution bridge (-eq8-g9-bouncefix) ────
@@ -6011,7 +6765,7 @@ test('eq8_f6_calendly_inline_phrase_wraps_to_anchor', ['eq8', 'composer', 'regre
     bridgeSentence: 'Three 0-to-1 builds that map directly to this:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 cloud kitchens, complaint rate -94%.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 15 Cr in 4 months.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 1.5 Cr in 4 months.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnerships from zero, 3 enterprise clients Q1.', showLorTag: false }
     ],
     motivationParagraph: 'The thread across all three: ownership and measurable outcomes.',
@@ -6077,7 +6831,7 @@ test('eq8_hr_tier1_routes_to_bullet_renderer', ['eq8', 'composer', 'regression']
     experienceBullets: [],
     bodyParagraphs: [
       'At Blinkit Bistro currently managing P&L across 50 cloud kitchens, complaint rate down 74%.',
-      'At upGrad built referral funnel from 0 to Rs 15 Cr in 4 months across 14 teams.',
+      'At upGrad built referral funnel from 0 to Rs 1.5 Cr in 4 months across 14 teams.',
       'At Great Learning built international B2B partnerships across 50+ countries from zero.'
     ],
     motivationParagraph: '',
@@ -6119,7 +6873,7 @@ test('eq8_hr_tier1_routes_to_bullet_renderer', ['eq8', 'composer', 'regression']
     bridgeSentence: 'Three 0-to-1 builds that show what this looks like in practice:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 cloud kitchens, complaint rate -74%.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 15 Cr in 4 months.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 1.5 Cr in 4 months.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnerships across 50+ countries from zero.', showLorTag: false }
     ],
     motivationParagraph: '',
@@ -6198,7 +6952,7 @@ test('eq8_std_tier1_routes_to_bullet_renderer', ['eq8', 'composer', 'regression'
     experienceBullets: [],   // model drift — empty
     bodyParagraphs: [
       'At Blinkit Bistro managing P&L across 50+ cloud kitchens, complaint rate down 94%.',
-      'At upGrad built referral funnels from 0 to Rs 15 Cr in 4 months across 14 teams.',
+      'At upGrad built referral funnels from 0 to Rs 1.5 Cr in 4 months across 14 teams.',
       'At Great Learning built B2B partnerships from zero across 50+ countries.'
     ],
     motivationParagraph: '',
@@ -6234,7 +6988,7 @@ test('eq8_std_tier1_routes_to_bullet_renderer', ['eq8', 'composer', 'regression'
     bridgeSentence: 'Three 0-to-1 builds map directly to this:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 cloud kitchens, complaint rate -94%.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 15 Cr in 4 months.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 1.5 Cr in 4 months.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnerships across 50+ countries from zero.', showLorTag: false }
     ],
     motivationParagraph: 'The thread across all three: ownership, cross-functional execution, measurable outcomes.',
@@ -6279,7 +7033,7 @@ test('eq8_calendly_link_guaranteed_both_renderers', ['eq8', 'composer', 'regress
     bridgeSentence: 'Three builds that map to this:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 kitchens, -94% complaints.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: '0 to Rs 15 Cr referral funnel in 4 months.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: '0 to Rs 1.5 Cr referral funnel in 4 months.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnerships from zero, 3 enterprise clients.', showLorTag: false }
     ],
     motivationParagraph: 'Common thread: ownership, execution, measurable outcomes.',
@@ -6340,7 +7094,7 @@ test('eq8_github_link_guaranteed_both_renderers', ['eq8', 'composer', 'regressio
     bridgeSentence: 'Three builds that map to this:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 kitchens, -94% complaints.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: '0 to Rs 15 Cr referral funnel.', showLorTag: false }
+      { label: 'upGrad (2021-23)', body: '0 to Rs 1.5 Cr referral funnel.', showLorTag: false }
     ],
     motivationParagraph: 'Common thread: ownership, cross-functional execution.',
     closingLogistics: 'Would value 15 minutes to discuss how this maps to what your team is building at GhCo.',
@@ -6489,7 +7243,7 @@ test('c4strong_render_has_3_width28px_bullet_rows', ['c4strong', 'composer', 're
     bridgeSentence: 'Three 0-to-1 builds that map directly to this:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 cloud kitchens, complaint rate cut 94% across 121K orders.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Category Growth: referral funnel from 0 to Rs 15 Cr in 4 months via ABM and MarTech.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Category Growth: referral funnel from 0 to Rs 1.5 Cr in 4 months via ABM and MarTech.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'Scaling Through Partnerships: built B2B pipeline reaching 3 enterprise clients in Q1.', showLorTag: false }
     ],
     motivationParagraph: 'The thread across all three: ownership, cross-functional execution, measurable outcomes.',
@@ -6588,7 +7342,7 @@ test('finalpolish_d1_bullet_label_no_duplication_std', ['finalpolish', 'composer
     bodyParagraphs: [
       // Real-draft pattern: company label appears at start of prose section
       'Blinkit Bistro (current): Senior Manager owning station P&L across 50 cloud kitchens resolving quality crisis at scale',
-      'upGrad (2021-23): Growth Lead building referral funnels from 0 to Rs 15 Cr in 4 months driving 100+ transitions',
+      'upGrad (2021-23): Growth Lead building referral funnels from 0 to Rs 1.5 Cr in 4 months driving 100+ transitions',
       'Great Learning (2019-20): Built B2B partnership pipeline reaching 3 enterprise clients in first quarter'
     ],
     motivationParagraph: '',
@@ -6649,7 +7403,7 @@ test('finalpolish_d1_bullet_label_no_duplication_hr', ['finalpolish', 'composer'
     experienceBullets: [],
     bodyParagraphs: [
       'Blinkit Bistro (current): Senior Manager owning station P&L across 50 cloud kitchens resolving quality crisis at scale with full ownership',
-      'upGrad (2021-23): Growth Lead building referral funnels from 0 to Rs 15 Cr in 4 months driving career transitions at scale',
+      'upGrad (2021-23): Growth Lead building referral funnels from 0 to Rs 1.5 Cr in 4 months driving career transitions at scale',
       'Great Learning (2019-20): Built B2B partnership pipeline reaching 3 enterprise clients in first quarter with zero prior pipeline'
     ],
     motivationParagraph: '',
@@ -6828,7 +7582,7 @@ test('contentguards_t2_bulletv1_github_dedup', ['contentguards', 'composer', 're
     bridgeSentence: 'Three 0-to-1 builds that map directly to this role:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 cloud kitchens.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 15 Cr.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 1.5 Cr.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnership pipeline.', showLorTag: false }
     ],
     motivationParagraph: 'The thread: ownership, execution, outcomes.',
@@ -6865,7 +7619,7 @@ test('contentguards_t3_bulletv1_greeting_dedup', ['contentguards', 'composer', '
     bridgeSentence: 'Three 0-to-1 builds:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 cloud kitchens.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 15 Cr.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 1.5 Cr.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnership pipeline.', showLorTag: false }
     ],
     motivationParagraph: '',
@@ -6896,7 +7650,7 @@ test('contentguards_t3_bulletv1_greeting_injected_when_absent', ['contentguards'
     bridgeSentence: 'Three 0-to-1 builds:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 kitchens.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Referral funnel Rs 15 Cr.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Referral funnel Rs 1.5 Cr.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnerships.', showLorTag: false }
     ],
     motivationParagraph: '',
@@ -7013,7 +7767,7 @@ test('builderblock_v2_canonical_header_and_items', ['builderblock', 'regression'
     bridgeSentence: 'Three 0-to-1 builds that map directly to this:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 cloud kitchens.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 15 Cr.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 1.5 Cr.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnership pipeline.', showLorTag: false }
     ],
     motivationParagraph: 'The thread: ownership, execution, outcomes.',
@@ -7079,7 +7833,7 @@ test('builderblock_v2_claude_duplication_scrubbed', ['builderblock', 'regression
     bridgeSentence: 'Three builds:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across 50 kitchens.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Referral funnel Rs 15 Cr.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Referral funnel Rs 1.5 Cr.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnerships.', showLorTag: false }
     ],
     motivationParagraph: 'Ownership and execution.',
@@ -8920,7 +9674,7 @@ test('strategy_tilt_identity_mirror_helper_catches_ta_claims', ['strategy_tilt',
   });
   // FALSE cases — must NOT fire
   var cleanFixtures = [
-    { field: 'hookParagraph', text: 'Built upGrad\'s referral funnel from 0 to Rs 15 Cr in 4 months.' },
+    { field: 'hookParagraph', text: 'Built upGrad\'s referral funnel from 0 to Rs 1.5 Cr in 4 months.' },
     { field: 'hookParagraph', text: 'I have scaled growth teams across quick-commerce and ed-tech for 4.5 years.' },
     { field: 'motivationParagraph', text: 'Growth & strategy operator who ships AI systems for lean teams.' }
   ];
@@ -8941,11 +9695,11 @@ test('strategy_tilt_quickvalidate_warns_ops_in_subject', ['strategy_tilt', 'regr
   }
   var parsed = {
     subjectLine: 'Job Application: Payments Growth & Ops | Gaurav Rathore',
-    bodyParagraphs: ['Built referral funnel from 0 to Rs 15 Cr in 4 months at upGrad.', 'Ran P&L for 50 cloud kitchens at Blinkit Bistro.'],
+    bodyParagraphs: ['Built referral funnel from 0 to Rs 1.5 Cr in 4 months at upGrad.', 'Ran P&L for 50 cloud kitchens at Blinkit Bistro.'],
     cta: '',
     // CXO shape (non-zero motivationParagraph) so bullet gate doesn't fire FATAL
     experienceBullets: [],
-    hookParagraph: 'Built referral funnel from 0 to Rs 15 Cr.',
+    hookParagraph: 'Built referral funnel from 0 to Rs 1.5 Cr.',
     motivationParagraph: 'Operator who ships the AI-native layer.',
     closingLogistics: 'Would value 15 minutes.',
     psLine: 'Youngest department lead at Great Learning.',
@@ -9012,7 +9766,7 @@ test('strategy_tilt_cxo_template_id_discriminator', ['strategy_tilt', 'regressio
     motivationParagraph: 'Operator phrase.',
     bridgeSentence: 'Bridge.',
     experienceBullets: [
-      { label: 'upGrad', body: 'Built ₹15 Cr funnel.', showLorTag: false },
+      { label: 'upGrad', body: 'Built ₹1.5 Cr funnel.', showLorTag: false },
       { label: 'Blinkit Bistro', body: 'Ran 50 kitchens.', showLorTag: false }
     ],
     showAiToolsBlock: true,  // will be forced to false by injection
@@ -9045,7 +9799,7 @@ test('strategy_tilt_cxo_renderer_uses_templateid', ['strategy_tilt', 'regression
       hookParagraph: 'Hook text here.',
       bridgeSentence: 'Bridge sentence.',
       experienceBullets: [
-        { label: 'upGrad', body: 'Built ₹15 Cr funnel in 4 months.', showLorTag: false },
+        { label: 'upGrad', body: 'Built ₹1.5 Cr funnel in 4 months.', showLorTag: false },
         { label: 'Blinkit Bistro', body: 'Ran ops for 50 kitchens, 4 cities.', showLorTag: false }
       ],
       motivationParagraph: 'Operator phrase.',
@@ -9170,7 +9924,7 @@ test('hr_layout_psLine_last_before_signature', ['hr_layout', 'regression'], func
     bridgeSentence: 'Three 0-to-1 builds that show what this looks like in practice:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L: 94% complaint cut across 121K orders. 30+ stakeholders.', showLorTag: false },
-      { label: 'upGrad (2021-23)',         body: 'Growth: referral funnel 0 to Rs 15 Cr in 4 months.', showLorTag: false },
+      { label: 'upGrad (2021-23)',         body: 'Growth: referral funnel 0 to Rs 1.5 Cr in 4 months.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'Partnerships: B2B pipeline from zero, 3 enterprise clients Q1.', showLorTag: false }
     ],
     showAiToolsBlock: true,
@@ -9312,7 +10066,7 @@ test('hr_layout_experience_bullets_count', ['hr_layout', 'regression'], function
     bridgeSentence: 'Three 0-to-1 builds that show what this looks like in practice:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L: 94% complaint reduction across 121K orders.', showLorTag: false },
-      { label: 'upGrad (2021-23)',         body: 'Growth: referral funnel Rs 0 to 15 Cr in 4 months.', showLorTag: false },
+      { label: 'upGrad (2021-23)',         body: 'Growth: referral funnel Rs 0 to 1.5 Cr in 4 months.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'Partnerships: 3 enterprise clients in Q1 from zero.', showLorTag: false }
     ],
     showAiToolsBlock: true,
@@ -9490,7 +10244,7 @@ test('fresh_first_m2_github_footer_absent_standard', ['fresh_first', 'regression
     bridgeSentence: 'Three 0-to-1 builds:',
     experienceBullets: [
       { label: 'Blinkit Bistro', body: 'P&L across 50 kitchens.', showLorTag: false },
-      { label: 'upGrad', body: 'Rs 15 Cr funnel.', showLorTag: false }
+      { label: 'upGrad', body: 'Rs 1.5 Cr funnel.', showLorTag: false }
     ],
     motivationParagraph: 'Ownership at scale.',
     closingLogistics: '15 minutes to discuss.',
@@ -9820,7 +10574,7 @@ test('template_unify_render_contract_bullet_v1', ['template_unify', 'regression'
     bridgeSentence: 'Three 0-to-1 builds that map directly to this role:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across ~50 cloud kitchens. 94% complaint cut. 30+ stakeholders.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 15 Cr in 4 months. 100+ transitions.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 1.5 Cr in 4 months. 100+ transitions.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnerships from zero. 3 enterprise clients Q1.', showLorTag: false }
     ],
     showAiToolsBlock: true,
@@ -9829,7 +10583,7 @@ test('template_unify_render_contract_bullet_v1', ['template_unify', 'regression'
     closingLogistics: 'Based in Gurgaon. Would value 15 minutes to discuss.',
     closingResume: 'Please find my resume attached.',
     signoffText: 'Thanks and regards',
-    psLine: 'Built upGrad referral funnel to Rs 15 Cr in 4 months.',
+    psLine: 'Built upGrad referral funnel to Rs 1.5 Cr in 4 months.',
     subjectLine: 'Growth & Strategy at OrgX'
   };
   var templateIds = ['T1_FOUNDER_NO_ROLE', 'T2_DOMAIN_EXPERT', 'T5_HIRING_GROWTH', 'T6_MUTUAL_CONNECTION'];
@@ -10075,7 +10829,7 @@ test('recomp_bullets_prose_cannot_replace_bullet_original', ['recomp_bullets', '
     bridgeSentence: 'Three 0-to-1 builds that map directly to this role:',
     experienceBullets: [
       { label: 'Blinkit Bistro (current)', body: 'P&L across ~50 cloud kitchens. 94% complaint cut. 30+ stakeholders.', showLorTag: false },
-      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 15 Cr in 4 months. 100+ transitions.', showLorTag: false },
+      { label: 'upGrad (2021-23)', body: 'Referral funnel 0 to Rs 1.5 Cr in 4 months. 100+ transitions.', showLorTag: false },
       { label: 'Great Learning (2019-20)', body: 'B2B partnerships from zero. 3 enterprise clients Q1.', showLorTag: false }
     ],
     showAiToolsBlock: true,
@@ -10084,7 +10838,7 @@ test('recomp_bullets_prose_cannot_replace_bullet_original', ['recomp_bullets', '
     closingLogistics: 'Based in Gurgaon. Would value 15 minutes to discuss.',
     closingResume: 'Please find my resume attached.',
     signoffText: 'Thanks and regards',
-    psLine: 'Built upGrad referral funnel to Rs 15 Cr in 4 months.',
+    psLine: 'Built upGrad referral funnel to Rs 1.5 Cr in 4 months.',
     subjectLine: 'Growth & Strategy at OrgX',
     templateId: 'T1_FOUNDER_NO_ROLE'
   };
@@ -12018,18 +12772,22 @@ test('op_budget_stamp_self_test', ['op_budget', 'regression'], function() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test('followup_thread_source_anchor_no_standalone_path_b', ['followup_thread', 'regression'], function() {
-  // (a) createFollowUpDraft must use thread.createDraftReply as the ONLY creation call.
-  // Path B (GmailApp.createDraft standalone with 'Re:') must be ABSENT.
-  // Deferred return { deferred: true, reason: 'no_thread_for_followup' } must be present.
+  // (a) FIX 2026-06-19-fu-recipient: createFollowUpDraft must create the reply via
+  // _fuCreateThreadedDraftToLead_ (lead-addressed Advanced-Service path) and must NOT
+  // call thread.createDraftReply( (which self-addresses on a self-started thread) nor
+  // GmailApp.createDraft( (Path B). Substring matches use a trailing '(' so the words
+  // in the explanatory comments don't trip the absence checks (toString includes comments).
   if (typeof createFollowUpDraft !== 'function') {
     assertTrue(false, 'followup_thread (a): createFollowUpDraft not in scope');
     return;
   }
   var src = createFollowUpDraft.toString();
-  assertContains(src, 'createDraftReply',
-    'followup_thread (a): createFollowUpDraft must call thread.createDraftReply (threaded reply path)');
-  assertTrue(src.indexOf('GmailApp.createDraft') < 0,
-    'followup_thread (a): createFollowUpDraft must NOT call GmailApp.createDraft (Path B removed)');
+  assertContains(src, '_fuCreateThreadedDraftToLead_',
+    'followup_thread (a): createFollowUpDraft must create the reply via _fuCreateThreadedDraftToLead_ (lead-addressed path)');
+  assertTrue(src.indexOf('thread.createDraftReply(') < 0,
+    'followup_thread (a): createFollowUpDraft must NOT call thread.createDraftReply( (self-addresses on self-started threads)');
+  assertTrue(src.indexOf('GmailApp.createDraft(') < 0,
+    'followup_thread (a): createFollowUpDraft must NOT call GmailApp.createDraft( (Path B removed)');
   assertContains(src, 'no_thread_for_followup',
     'followup_thread (a): createFollowUpDraft must return deferred reason no_thread_for_followup when no thread resolves');
   assertContains(src, 'deferred',
@@ -12058,10 +12816,14 @@ test('followup_thread_plain_to_html_blank_lines', ['followup_thread', 'regressio
     return;
   }
   var result = _fuPlainToHtml('Hello world\n\nSecond paragraph');
-  assertContains(result, '<p style="margin:0 0 12px">Hello world</p>',
-    'followup_thread (b): blank-line must produce <p> tag with correct style');
-  assertContains(result, '<p style="margin:0 0 12px">Second paragraph</p>',
+  // 2026-06-20-fu-format: paragraphs are now styled (Calibri body font) — assert content-in-<p>
+  // + the styling, not the exact old bare-<p> string.
+  assertContains(result, '>Hello world</p>',
+    'followup_thread (b): blank-line must produce a <p> wrapping the first paragraph');
+  assertContains(result, '>Second paragraph</p>',
     'followup_thread (b): second paragraph block must also be wrapped in <p>');
+  assertContains(result, 'font-family:Calibri',
+    'followup_thread (b): follow-up paragraphs must carry the body font styling');
 });
 
 test('followup_thread_plain_to_html_single_newline', ['followup_thread', 'regression'], function() {
@@ -13263,6 +14025,47 @@ test('employer_reconcile_at_sign_company', ['employer_reconcile', 'regression'],
   var got = _extractHeadlineCurrentCompany('Category Leader @Anthropic | 17+ years');
   assertTrue(got === 'Anthropic', '@Anthropic → Anthropic; got: ' + got);
 });
+test('trustorg_toggle_and_hold_helpers_defined_and_whitelisted', ['employer_reconcile', 'regression'], function() {
+  assertTrue(typeof menuSetEmployerReconcileEnabled === 'function', 'menuSetEmployerReconcileEnabled must be defined');
+  assertTrue(typeof menuUnlockEmailAndHold === 'function', 'menuUnlockEmailAndHold must be defined');
+  assertContains(doGet.toString(), "'menuSetEmployerReconcileEnabled'", 'reconcile toggle must be whitelisted');
+  assertContains(doGet.toString(), "'menuUnlockEmailAndHold'", 'unlock+hold must be whitelisted');
+  assertContains(menuUnlockEmailAndHold.toString(), '_emailLockClear_', 'unlock+hold must clear the durable lock');
+});
+test('orgoverride_durable_store_roundtrips', ['employer_reconcile', 'regression'], function() {
+  var probeRow = 990002;
+  try {
+    assertTrue(_orgOverrideSet_(probeRow, 'Wishlink') === true, 'org override set returns true');
+    assertTrue(_orgOverrideGet_(probeRow) === 'Wishlink', 'org override get returns the verified org');
+    _orgOverrideClear_(probeRow);
+    assertTrue(_orgOverrideGet_(probeRow) === '', 'org override clear removes it');
+  } finally { try { _orgOverrideClear_(probeRow); } catch (_) {} }
+});
+test('orgoverride_applied_in_process_one_lead', ['employer_reconcile', 'regression'], function() {
+  assertContains(_processOneLead.toString(), '_orgOverrideGet_',
+    '_processOneLead must apply the human-verified org override before composition');
+});
+test('orgoverride_fix_employer_helper_defined_and_whitelisted', ['employer_reconcile', 'regression'], function() {
+  assertTrue(typeof menuFixEmployerAndPromote === 'function', 'menuFixEmployerAndPromote must be defined');
+  assertContains(doGet.toString(), "'menuFixEmployerAndPromote'", 'fix-employer must be whitelisted');
+  var src = menuFixEmployerAndPromote.toString();
+  assertContains(src, '_orgOverrideSet_', 'must set the org override (fixes the body)');
+  assertContains(src, '_emailLockSet_', 'LOCK mode must set the durable email lock for a known address');
+  assertContains(src, '_emailLockClear_', 'ENGINE mode must clear any prior guess so the 3-tier engine re-derives + validates');
+  assertContains(src, 'EMAIL_REENRICH', 'ENGINE mode must mark the lead for engine re-derivation');
+});
+test('employer_reconcile_exsegment_company_not_current', ['employer_reconcile', 'regression'], function() {
+  // KEYSTONE (Bhavya): a company named only inside an "Ex …" segment must NOT be returned as the
+  // current employer — otherwise _reconcileCurrentEmployer overwrites a correct org and the whole
+  // letter + email target the ex-employer (subject "for Bistro", domain bistro.sk).
+  var hl = 'Flipkart | Ex Product @Bistro, Analytics @ Blinkit';
+  assertTrue(_extractHeadlineCurrentCompany(hl) === '',
+    'ex-segment @Bistro/@Blinkit must NOT be returned as current; got: ' + _extractHeadlineCurrentCompany(hl));
+  var lead = { headline: hl, organization: 'Flipkart', email: 'bhavya.sharma@flipkart.com' };
+  var r = _reconcileCurrentEmployer(lead);
+  assertTrue(r.corrected === false, 'must NOT "correct" a valid current org toward an ex-employer');
+  assertTrue(lead.organization === 'Flipkart', 'org must stay Flipkart; got: ' + lead.organization);
+});
 test('employer_reconcile_conflict_overrides_org', ['employer_reconcile', 'regression'], function() {
   var lead = { headline: 'GTM (Public Sector, Healthcare & Education) at Anthropic',
                designation: 'National Sales Leader for Healthcare & Nonprofit | AWS India',
@@ -13293,6 +14096,489 @@ test('employer_reconcile_keeps_personal_email', ['employer_reconcile', 'regressi
 test('employer_reconcile_wired_in_process_one_lead', ['employer_reconcile', 'regression'], function() {
   assertContains(_processOneLead.toString(), '_reconcileCurrentEmployer',
     '_processOneLead must call _reconcileCurrentEmployer before enrichment');
+});
+
+// ─── HEADLINE→ORG REMOVED ENTIRELY (2026-06-24-experience-present-only) ──────
+// User directive: stop picking the current org from headline text anywhere; org comes
+// ONLY from the LinkedIn Experience-"Present" entry (APK Vision) + human ORG_OVERRIDE.
+// These pins lock the removal so it cannot silently regress (esp. the fail-open landmine).
+test('headline_org_override_HARD_RETIRED', ['no_headline_org', 'employer_reconcile', 'regression'], function() {
+  // The headline→organization OVERRIDE used to default fail-open ON, suppressed only by a
+  // ScriptProperty (EMPLOYER_RECONCILE_ENABLED=0) — clearing it resurrected the wrong-org
+  // override. It now returns false UNCONDITIONALLY in code, so it can never run.
+  assertTrue(_employerReconcileEnabled_() === false,
+    'employer-reconcile override must be permanently OFF (org is never derived from a headline)');
+  assertContains(_employerReconcileEnabled_.toString(), 'return false',
+    'the kill-switch must be a hard code-level false, NOT a fail-open ScriptProperty read');
+});
+test('server_headline_org_extractor_RETIRED', ['no_headline_org', 'regression'], function() {
+  // _extractOrgFromHeadlineServer is hard-stubbed to ALWAYS return '' (the §5b caller in
+  // _sanitizeIncomingPayload was removed too). A blank org now PARKS the lead at review
+  // instead of being guessed from headline marketing copy.
+  assertTrue(_extractOrgFromHeadlineServer('Senior PM at Nothing') === '',
+    'retired server headline-extractor must return empty (used to return "Nothing")');
+  assertTrue(_extractOrgFromHeadlineServer('Growth Lead, Razorpay | Bengaluru') === '',
+    'retired server headline-extractor must return empty (used to return "Razorpay")');
+  assertTrue(_extractOrgFromHeadlineServer('Engineer @ Stripe') === '',
+    'retired server headline-extractor must return empty (used to return "Stripe")');
+});
+
+// ─── ORG "LOGICAL WINNER" ARBITRATION (2026-06-24-org-arbitration) ──────────────
+// Vision↔Apollo org winner, GUARDED against the S.Roy domain-echo trap. Adversarially
+// designed (3-design panel + 9-fixture stress, 9/9 pass). Pure-function fixtures + wiring.
+test('orgarb_echo_directional_label_wraps_org', ['org_arbitration', 'regression'], function() {
+  assertTrue(_isApolloOrgDomainEcho_('STAN', 'getstan.app') === true, 'getstan wraps stan = echo');
+  assertTrue(_isApolloOrgDomainEcho_('Bar', 'joinbar.com') === true, 'joinbar wraps bar = echo');
+  assertTrue(_isApolloOrgDomainEcho_('Foo', 'thefoo.io') === true, 'thefoo wraps foo = echo');
+  assertTrue(_isApolloOrgDomainEcho_('Stripe', 'stripe.com') === false, 'exact stripe==stripe = NOT echo (normal employee)');
+  assertTrue(_isApolloOrgDomainEcho_('Acmetech', 'acme.io') === false, 'org wraps label (real longer name) = NOT echo (directional refinement)');
+  assertTrue(_isApolloOrgDomainEcho_('Globex', '') === false, 'un-derivable label = NOT echo (fills + [VERIFY])');
+});
+test('orgarb_sroy_gate_blank_vision_echo_suppressed', ['org_arbitration', 'regression'], function() {
+  var r = _resolveOrgFromSignals('', 'STAN', 'getstan.app', 's.roy@getstan.app', 's.roy@getstan.app');
+  assertTrue(r.org === '', 'S.Roy: echo org must NOT fill; got "' + r.org + '"');
+  assertTrue(r.flag === 'needs_review', 'S.Roy → needs_review');
+  var r2 = _resolveOrgFromSignals('', 'STAN', 'getstan.app', 'sumit@gmail.com', 's.roy@getstan.app');
+  assertTrue(r2.org === '', 'echo fires before corroboration — independent email cannot rescue an echo');
+});
+test('orgarb_apollo_fallback_fills_safe_orgs', ['org_arbitration', 'regression'], function() {
+  var r = _resolveOrgFromSignals('', 'Stripe', 'stripe.com', 'jane@stripe.com', 'jane@stripe.com');
+  assertTrue(r.org === 'Stripe', 'normal employee exact-domain fills; got "' + r.org + '"');
+  assertTrue(r.flag === 'apollo_sourced_verify', 'apollo-sourced → [VERIFY] flag');
+  var r2 = _resolveOrgFromSignals('', 'Razorpay', 'razorpay.com', 'arjun@razorpay.com', 'other@razorpay.com');
+  assertTrue(r2.org === 'Razorpay' && r2.source === 'apollo_fallback', 'independent-email corroborated fill');
+  var r3 = _resolveOrgFromSignals('', 'Globex', '', '', '');
+  assertTrue(r3.org === 'Globex' && r3.flag === 'apollo_sourced_verify', 'un-derivable label still fills + [VERIFY], never blind-silent');
+});
+test('orgarb_vision_wins_and_corroboration', ['org_arbitration', 'regression'], function() {
+  var only = _resolveOrgFromSignals('Google', '', '', '', '');
+  assertTrue(only.org === 'Google' && only.flag === '', 'vision-only clean fill');
+  var agree = _resolveOrgFromSignals('Notion', 'Notion Labs', 'notion.so', '', '');
+  assertTrue(agree.org === 'Notion' && agree.source === 'vision+apollo_corroborated' && agree.flag === '',
+    'agree → keep Vision spelling, corroborated, no flag');
+  var edge = _resolveOrgFromSignals('STAN', 'STAN', 'getstan.app', '', '');
+  assertTrue(edge.org === 'STAN' && edge.flag === '', 'echo guard must NOT blank a Vision-confirmed org (Constraint 3)');
+});
+test('orgarb_disagreement_vision_wins_flagged', ['org_arbitration', 'regression'], function() {
+  var r = _resolveOrgFromSignals('Anthropic', 'Amazon Web Services', 'amazon.com', '', 'p@amazon.com');
+  assertTrue(r.org === 'Anthropic', 'disagree: Vision wins, never silently overridden; got "' + r.org + '"');
+  assertTrue(r.flag === 'org_disagreement', 'disagree → org_disagreement flag for [VERIFY]');
+  assertTrue(r.alternate === 'Amazon Web Services', 'losing Apollo org recorded in alternate');
+});
+test('orgarb_both_blank_review', ['org_arbitration', 'regression'], function() {
+  var r = _resolveOrgFromSignals('', '', '', '', '');
+  assertTrue(r.org === '' && r.flag === 'needs_review', 'both blank → needs_review, never fabricate');
+});
+test('orgarb_wired_at_all_sites_and_verify', ['org_arbitration', 'regression'], function() {
+  assertContains(_processOneLead.toString(), '_applyOrgArbitration_',
+    'enrichment backfill must route Apollo org through the arbiter (was the unguarded line-1088 fill)');
+  assertContains(_recoverIdentityFromUrl.toString(), '_resolveOrgFromSignals',
+    'identity-recovery Apollo fill must route through the arbiter (the 2nd unguarded site)');
+  assertContains(createDraft.toString(), 'orgArbVerify',
+    'GmailDrafter [VERIFY] union must read lead.orgArbVerify (survives finalizer riskFlags overwrite)');
+});
+
+// ─── GMAIL THREAD DEEP-LINK (2026-06-24-gmail-deeplink) ─────────────────────────
+// Research: the Gmail Android app has NO public thread deep-link and App Links strip the
+// URL #fragment, so "#inbox/<threadId>" lands on inbox HOME. Only the rfc822msgid search URL
+// (keyed by the RFC-2822 Message-ID, captured at draft time) renders the actual conversation.
+test('gmail_threadlink_prefers_rfc822msgid', ['gmail_deeplink', 'regression'], function() {
+  var withId = _gmailThreadDeepLink_('<CABc123xyz@mail.gmail.com>', 'thread999');
+  assertContains(withId, '#search/rfc822msgid:',
+    'with a Message-ID, must build the rfc822msgid search URL; got: ' + withId);
+  assertTrue(withId.indexOf('<') < 0 && withId.indexOf('%3C') < 0,
+    'angle brackets must be stripped from the Message-ID; got: ' + withId);
+  var legacy = _gmailThreadDeepLink_('', 'thread999');
+  assertTrue(legacy === 'https://mail.google.com/mail/u/0/#inbox/thread999',
+    'no Message-ID → legacy #inbox/<threadId> fallback; got: ' + legacy);
+  assertTrue(_gmailThreadDeepLink_('', '') === null, 'no id + no thread → null');
+});
+
+// ─── DEDUP CORRECTION-PATH (2026-06-24-dedup-correction) ────────────────────
+// A re-scan whose org CONFLICTS with an ACTIVE canonical is a CORRECTION, not a redundant
+// duplicate (Manpreet: stale "Zomato" canonical, re-scan "boAt"). _dedupShouldCorrect_ gates it;
+// the scanner applies it via menuFixEmployerAndPromote. Terminal/human-killed canonicals are honored.
+test('dedup_correction_fires_on_active_canonical_org_conflict', ['dup_lead', 'dedup_correction', 'regression'], function() {
+  assertTrue(_dedupShouldCorrect_('DRAFT_CREATED', 'boat Lifestyle', 'Zomato I AdTech I GTM I Product Management') === true,
+    'active canonical (DRAFT_CREATED) + conflicting org (boAt vs Zomato) MUST trigger a correction');
+  assertTrue(_dedupShouldCorrect_('NEEDS_REVIEW', 'boat Lifestyle', 'Zomato') === true,
+    'other re-draftable states also correct');
+});
+test('dedup_correction_honors_terminal_canonical', ['dup_lead', 'dedup_correction', 'regression'], function() {
+  // NEVER resurrect a deliberately-closed lead — the dedup\'s original contract.
+  assertTrue(_dedupShouldCorrect_('DRAFT_DELETED', 'boat Lifestyle', 'Zomato') === false, 'DRAFT_DELETED is human-killed');
+  assertTrue(_dedupShouldCorrect_('SENT', 'boat Lifestyle', 'Zomato') === false, 'SENT is terminal');
+  assertTrue(_dedupShouldCorrect_('REPLIED', 'boat Lifestyle', 'Zomato') === false, 'REPLIED is terminal');
+  assertTrue(_dedupShouldCorrect_('BOUNCED_HARD', 'boat Lifestyle', 'Zomato') === false, 'BOUNCED is terminal');
+});
+test('dedup_correction_skips_non_conflict_and_junk', ['dup_lead', 'dedup_correction', 'regression'], function() {
+  assertTrue(_dedupShouldCorrect_('DRAFT_CREATED', 'Zomato', 'Zomato') === false, 'same org → redundant dup, no correction');
+  assertTrue(_dedupShouldCorrect_('DRAFT_CREATED', 'Zomato Ltd', 'Zomato') === false, 'overlapping org → not a conflict');
+  assertTrue(_dedupShouldCorrect_('DRAFT_CREATED', '', 'Zomato') === false, 'empty candidate org → no correction');
+});
+test('dedup_correction_wired_into_dispatch', ['dup_lead', 'dedup_correction', 'regression'], function() {
+  var src = scanAndDispatch.toString();
+  assertContains(src, '_dedupShouldCorrect_', 'dedup-marking site must consult _dedupShouldCorrect_');
+  assertContains(src, 'menuFixEmployerAndPromote', 'a confirmed correction must apply via menuFixEmployerAndPromote');
+  assertContains(src, '_orgOverrideGet_', 'must pass the canonical org override for the idempotency (anti-loop) guard');
+});
+test('dedup_correction_idempotent_once_overridden', ['dup_lead', 'dedup_correction', 'regression'], function() {
+  // ★LOOP GUARD: once the canonical is org-overridden to the corrected employer, the correction
+  // must NOT re-fire — the Sheet2 org cell stays stale (UNIQUE spill), so the cell-vs-candidate
+  // conflict is permanent; re-firing every scan caused a live re-draft loop on Manpreet.
+  assertTrue(_dedupShouldCorrect_('DRAFT_CREATED', 'boat Lifestyle', 'Zomato I AdTech', 'boat Lifestyle') === false,
+    'already overridden to boAt → must NOT re-correct (idempotent / anti-loop)');
+  assertTrue(_dedupShouldCorrect_('DRAFT_CREATED', 'boat Lifestyle', 'Zomato I AdTech', '') === true,
+    'no prior override → still corrects on the FIRST pass');
+  assertTrue(_dedupShouldCorrect_('DRAFT_CREATED', 'boat Lifestyle', 'Zomato I AdTech', 'Zomato') === true,
+    'override still points at the WRONG org → correction may proceed');
+});
+
+// ─── DEMO SELF-PROFILE (2026-06-24-demo-self) ───────────────────────────────
+// Owner-scoped showcase: scanning the owner's OWN LinkedIn yields a hard-coded "engine found
+// the most accurate email" address + a Growth/GTM-Ops-themed draft. MUST never touch real leads.
+test('demo_self_profile_scoped_to_owner_slug', ['demo_self', 'regression'], function() {
+  assertTrue(_isDemoSelfProfile_('https://www.linkedin.com/in/gaurav1-grow-learn-together/') === true,
+    'owner slug → demo ON');
+  assertTrue(_isDemoSelfProfile_('https://www.linkedin.com/in/gaurav1-grow-learn-together') === true,
+    'owner slug (no trailing slash) → demo ON');
+  assertTrue(_isDemoSelfProfile_('https://www.linkedin.com/in/manpreet-kaur-pm') === false,
+    'a REAL lead → demo OFF (never affects real leads)');
+  assertTrue(_isDemoSelfProfile_('') === false, 'empty url → off');
+});
+test('demo_self_wired_into_enrich_and_drafter', ['demo_self', 'regression'], function() {
+  var es = enrichEmail.toString();
+  assertContains(es, '_isDemoSelfProfile_', 'enrichEmail must short-circuit on the owner-self demo profile');
+  assertContains(es, '_DEMO_SELF_EMAIL', 'demo returns the showcase email constant');
+  assertTrue(_DEMO_SELF_EMAIL === 'most_accurate_mail_ID@3-layer-engine.com', 'showcase email value is the demo address');
+  assertContains(es, 'Growth & GTM Ops', 'demo themes the draft for Growth & GTM Ops');
+  assertContains(createDraft.toString(), 'isDemoSelf', 'GmailDrafter [VERIFY] union exempts the demo self-profile (clean subject)');
+  // @288: the FINALIZER must ALSO short-circuit the demo — otherwise its org-domain gate
+  // rejects the fake demo domain (3-layer-engine.com) and blanks the email ("blank mail ID" bug).
+  var fin = finalizeEmailSelection.toString();
+  assertContains(fin, 'isDemoSelf', 'finalizeEmailSelection must bypass for the demo self-profile');
+  assertContains(fin, 'demo_3layer_engine', 'finalizer demo bypass returns the showcase source, skipping gate/tiers');
+});
+
+test('requeue_degraded_drafts_self_identifies_by_marker', ['diagnostic', 'vendor_resilience', 'regression'], function() {
+  if (typeof menuRequeueDegradedTodayDrafts !== 'function') { assertTrue(false, 'menuRequeueDegradedTodayDrafts not in scope'); return; }
+  var src = menuRequeueDegradedTodayDrafts.toString();
+  // @2026-06-29: must self-identify degraded drafts by NOTE content, not a frozen incident date.
+  assertContains(src, 'claude_api_error', 'requeue must target Claude-degraded drafts by note marker');
+  assertTrue(src.indexOf("new Date('2026-06-12") < 0, 'requeue must NOT be hardcoded to a frozen incident-date window (the comment may reference it)');
+  assertContains(src, "'DRAFT_CREATED'", 'requeue must only touch DRAFT_CREATED rows (never terminal/human-killed)');
+  assertContains(src, "'NEW'", 'requeue must set STATUS=NEW so the lead recomposes (idempotent re-run)');
+  assertContains(src, 'cutoff', 'requeue must apply a recent-only cutoff guard');
+});
+
+// ─── verify-email hold tests (2026-06-17-verify-email-hold; 2026-06-22-no-hold) ──────
+// 2026-06-22-no-hold (user directive + research "Quarantine pattern"): low-confidence guesses
+// now DRAFT (flagged with low EMAIL_CONFIDENCE + [LOW_CONFIDENCE_DRAFT] note) by DEFAULT — never
+// parked. The VERIFY_EMAIL park is opt-in via ScriptProperty EMAIL_VERIFY_HARD_HOLD='1'.
+test('verify_email_hold_gate_wired', ['verify_email_hold', 'regression'], function() {
+  var src = _processOneLead.toString();
+  assertContains(src, 'verify_recipient_before_send', 'gate must key on the finalizer verify_recipient_before_send flag');
+  assertContains(src, 'LOW_CONFIDENCE_DRAFT', 'no-hold default must annotate + draft low-confidence guesses');
+  assertContains(src, 'EMAIL_VERIFY_HARD_HOLD', 'the VERIFY_EMAIL park must be the opt-in hard-hold branch');
+});
+test('verify_email_hold_respects_promotion_marker', ['verify_email_hold', 'regression'], function() {
+  assertContains(_processOneLead.toString(), 'EMAIL_VERIFIED_BY_USER',
+    'a user-promoted lead must bypass the hold gate via the [EMAIL_VERIFIED_BY_USER] marker');
+});
+test('verify_email_hold_has_killswitch', ['verify_email_hold', 'regression'], function() {
+  // 2026-06-22-no-hold: the (now opt-in) park behavior is gated by the EMAIL_VERIFY_HARD_HOLD
+  // escape hatch; default is draft-and-flag. The switch lets an operator restore the old hold.
+  assertContains(_processOneLead.toString(), 'EMAIL_VERIFY_HARD_HOLD',
+    'the opt-in VERIFY_EMAIL park must be guarded by the EMAIL_VERIFY_HARD_HOLD escape hatch');
+});
+test('verify_email_not_auto_recovered', ['verify_email_hold', 'regression'], function() {
+  assertTrue(STUCK_AUTO_RECOVER_STATUSES.indexOf('VERIFY_EMAIL') < 0,
+    'VERIFY_EMAIL must NOT be auto-recovered (would re-guess + re-hold in a loop)');
+});
+test('verify_email_is_human_decided', ['verify_email_hold', 'regression'], function() {
+  assertTrue(HUMAN_DECIDED_STATUSES['VERIFY_EMAIL'] === true,
+    'VERIFY_EMAIL must be registered human-decided so it holds');
+});
+test('verify_email_promote_fn_defined_and_whitelisted', ['verify_email_hold', 'regression'], function() {
+  assertTrue(typeof menuPromoteEmailVerify === 'function', 'menuPromoteEmailVerify must be defined');
+  assertContains(doGet.toString(), "'menuPromoteEmailVerify'", 'menuPromoteEmailVerify must be whitelisted in admin_run');
+});
+// 2026-06-22-verify-subject: unverified-recipient drafts get a non-deletable
+// [VERIFY] subject prefix so the risk is un-missable at the manual Send moment
+// (honors the no-hold directive — still drafts + proceeds, never parks).
+test('verify_subject_prefix_wired', ['verify_email_hold', 'regression'], function() {
+  var src = createDraft.toString();
+  assertContains(src, '[VERIFY]', 'createDraft must prepend a [VERIFY] subject marker for unverified recipients');
+  assertContains(src, 'verify_recipient_before_send', 'the [VERIFY] prefix must fire on the verify_recipient_before_send risk flag');
+  assertContains(src, 'org_recipient_mismatch', 'the [VERIFY] prefix must also fire on org_recipient_mismatch');
+});
+
+// 2026-06-22 (A2 tracking-count fix): the APK tracking count must show the TRUE
+// sheet total, not the fetched page (lead_dashboard caps at limit=50). The app
+// reads it from the server's `totalInSheet` field — pin that the server emits it.
+test('lead_dashboard_returns_total_in_sheet', ['tracking_count', 'regression'], function() {
+  assertContains(_handleLeadDashboardRequest.toString(), 'totalInSheet',
+    'lead_dashboard must return totalInSheet — the APK count reads it, never the page size');
+});
+
+// ─── bounce classification tests (2026-06-17-bounce-classify) ───────────────
+test('bounce_classify_routing_loop_is_recipient_side', ['bounce_classify', 'regression'], function() {
+  var c = _classifyBounceReason({ statusCode: '5.4.6', reason: '554 5.4.6 Routing loop detected', category: 'hard' });
+  assertTrue(c.klass === 'recipient_side', 'routing loop (5.4.6) → recipient_side; got: ' + c.klass);
+});
+test('bounce_classify_no_such_user', ['bounce_classify', 'regression'], function() {
+  var c = _classifyBounceReason({ statusCode: '5.1.1', reason: 'user unknown / no such user', category: 'hard' });
+  assertTrue(c.klass === 'no_such_user', 'user unknown (5.1.1) → no_such_user; got: ' + c.klass);
+});
+test('bounce_classify_generic_is_other', ['bounce_classify', 'regression'], function() {
+  var c = _classifyBounceReason({ statusCode: '5.0.0', reason: 'delivery failed' });
+  assertTrue(c.klass === 'other', 'unclassified hard bounce → other; got: ' + c.klass);
+  assertTrue(!!c.action, 'every classification must carry a recommended action');
+});
+test('bounce_classify_wired_in_markbounced', ['bounce_classify', 'regression'], function() {
+  assertContains(_markLeadRowBounced.toString(), '_classifyBounceReason',
+    '_markLeadRowBounced must annotate bounces via _classifyBounceReason');
+});
+
+// ─── draft-sync transient-guard tests (2026-06-18-draftsync-transient) ──────
+// A transient getDraft() error must NOT be treated as "draft gone" (that mass-
+// marked 269 live drafts DRAFT_DELETED). Only an explicit not-found counts.
+test('draftsync_transient_error_is_not_gone', ['draftsync', 'regression'], function() {
+  assertTrue(_draftLookupErrorMeansGone('Service invoked too many times for one day: gmail') === false,
+    'a transient Gmail error must NOT mean the draft is gone');
+  assertTrue(_draftLookupErrorMeansGone('We are sorry, a server error occurred. Please try again') === false,
+    'a server/try-again error must NOT mean gone');
+});
+test('draftsync_notfound_error_is_gone', ['draftsync', 'regression'], function() {
+  assertTrue(_draftLookupErrorMeansGone('No item with the given ID could be found, or you do not have permission') === true,
+    'an explicit not-found must mean the draft is genuinely gone');
+});
+test('draftsync_empty_error_is_not_gone', ['draftsync', 'regression'], function() {
+  assertTrue(_draftLookupErrorMeansGone('') === false, 'an empty/unknown error must NOT conclude gone (fail safe)');
+});
+test('draftsync_syncer_uses_transient_guard', ['draftsync', 'regression'], function() {
+  assertContains(syncSentDrafts.toString(), '_draftLookupErrorMeansGone',
+    'syncSentDrafts must gate DRAFT_DELETED behind _draftLookupErrorMeansGone (skip transient lookups)');
+});
+test('draftsync_restore_fn_defined_and_whitelisted', ['draftsync', 'regression'], function() {
+  assertTrue(typeof menuRestoreFalseDeletedDrafts === 'function', 'menuRestoreFalseDeletedDrafts must be defined');
+  assertContains(doGet.toString(), "'menuRestoreFalseDeletedDrafts'", 'recovery fn must be whitelisted in admin_run');
+});
+
+// ─── follow-up recipient fix tests (2026-06-19-fu-recipient) ────────────────
+// The follow-up reply MUST be addressed to the LEAD, not self. GmailApp.createDraftReply
+// self-addresses on a self-started thread (probed live), and its `to` option is ignored —
+// so we build the MIME ourselves and create the draft via the Gmail Advanced Service with
+// an explicit To: + threadId. These pin the pure builders and the wiring/guards.
+test('furecipient_recipient_is_self_detects_match', ['fu_recipient', 'regression'], function() {
+  assertTrue(_fuRecipientIsSelf_('Me@Gmail.com', 'me@gmail.com') === true, 'self-match is case-insensitive');
+  assertTrue(_fuRecipientIsSelf_('lead@adobe.com', 'me@gmail.com') === false, 'a different address is not self');
+  assertTrue(_fuRecipientIsSelf_('', 'me@gmail.com') === false, 'empty recipient is not self');
+  assertTrue(_fuRecipientIsSelf_('me@gmail.com', '') === false, 'empty owner cannot prove self (fail open)');
+});
+
+test('furecipient_mime_addresses_lead_not_self', ['fu_recipient', 'regression'], function() {
+  var mime = _fuBuildRawMime_('"Gaurav Rathore" <me@gmail.com>', 'vjuvvala@adobe.com',
+    'Re: Job Application', '', 'plain body', '<p>html body</p>');
+  assertContains(mime, 'To: vjuvvala@adobe.com', 'MIME To: header must address the LEAD');
+  assertContains(mime, 'From: "Gaurav Rathore" <me@gmail.com>', 'MIME From: header preserved');
+  assertContains(mime, 'Subject: Re: Job Application', 'MIME Subject: header preserved');
+  assertTrue(mime.indexOf('To: me@gmail.com') < 0, 'MIME must NOT address the owner (self) as the recipient');
+});
+
+test('furecipient_mime_inreplyto_only_when_msgid', ['fu_recipient', 'regression'], function() {
+  var withId = _fuBuildRawMime_('', 'lead@x.com', 'Re: s', 'CABC123@mail.gmail.com', 'p', '<p>h</p>');
+  assertContains(withId, 'In-Reply-To: <CABC123@mail.gmail.com>', 'In-Reply-To must be angle-bracketed when msgId present');
+  assertContains(withId, 'References: <CABC123@mail.gmail.com>', 'References must mirror In-Reply-To');
+  var noId = _fuBuildRawMime_('', 'lead@x.com', 'Re: s', '', 'p', '<p>h</p>');
+  assertTrue(noId.indexOf('In-Reply-To:') < 0, 'In-Reply-To must be omitted when no msgId');
+});
+
+test('furecipient_mime_multipart_base64_parts', ['fu_recipient', 'regression'], function() {
+  var mime = _fuBuildRawMime_('', 'lead@x.com', 'Re: s', '', 'PLAINTOKEN', '<p>HTMLTOKEN</p>');
+  assertContains(mime, 'multipart/alternative', 'must be multipart/alternative');
+  assertContains(mime, 'text/plain; charset="UTF-8"', 'must carry a text/plain part');
+  assertContains(mime, 'text/html; charset="UTF-8"', 'must carry a text/html part');
+  assertContains(mime, Utilities.base64Encode('PLAINTOKEN', Utilities.Charset.UTF_8),
+    'plain part must be the base64 of the plain text');
+  assertContains(mime, Utilities.base64Encode('<p>HTMLTOKEN</p>', Utilities.Charset.UTF_8),
+    'html part must be the base64 of the html body');
+});
+
+test('furecipient_create_defers_on_empty_email', ['fu_recipient', 'regression'], function() {
+  var r = _fuCreateThreadedDraftToLead_('threadX', '', 'Re: s', '<p>h</p>', 'h', '', 'Name');
+  assertTrue(!!r && r.ok === false && r.reason === 'no_lead_email',
+    'an empty lead email must defer (no_lead_email), never create a draft');
+});
+
+test('furecipient_create_uses_advanced_service_and_self_guard', ['fu_recipient', 'regression'], function() {
+  var src = _fuCreateThreadedDraftToLead_.toString();
+  assertContains(src, 'Gmail.Users.Drafts.create', 'must create the draft via the Gmail Advanced Service');
+  assertContains(src, '_fuRecipientIsSelf_', 'must guard against self-addressing via _fuRecipientIsSelf_');
+  assertContains(src, 'threadId', 'must thread the draft via threadId');
+});
+
+test('furecipient_createfollowup_wired_to_lead_path', ['fu_recipient', 'regression'], function() {
+  assertContains(createFollowUpDraft.toString(), '_fuCreateThreadedDraftToLead_',
+    'createFollowUpDraft must route through the lead-addressed Advanced-Service path');
+});
+
+test('furecipient_probe_defined_and_whitelisted', ['fu_recipient', 'regression'], function() {
+  assertTrue(typeof menuTestGmailApiDraft === 'function', 'menuTestGmailApiDraft must be defined');
+  assertContains(doGet.toString(), "'menuTestGmailApiDraft'", 'verification probe must be whitelisted in admin_run');
+});
+
+// ─── follow-up FORMATTING tests (2026-06-20-fu-format) ──────────────────────
+// Follow-ups rendered unformatted because _fuPlainToHtml emitted bare <p> with no font. They must
+// now carry the cold-email body styling + a wrapper div, and the scrub must exist to regenerate residue.
+test('fuformat_plain_to_html_is_styled', ['fu_format', 'regression'], function() {
+  var h = _fuPlainToHtml('Hi Parth,\n\nOne thing.\n\nGaurav');
+  assertContains(h, 'font-family:Calibri', 'follow-up HTML must carry the body font (was unstyled default-serif)');
+  assertContains(h, '<p style="margin:0 0 14px', 'paragraphs must be styled');
+  assertTrue(h.indexOf('<div') === 0, 'must wrap the body in a styled container div');
+});
+test('fuformat_scrub_defined_and_whitelisted', ['fu_format', 'regression'], function() {
+  assertTrue(typeof menuScrubSelfAddressedFollowups === 'function', 'scrub must be defined');
+  assertContains(doGet.toString(), "'menuScrubSelfAddressedFollowups'", 'scrub must be whitelisted in admin_run');
+  assertContains(menuScrubSelfAddressedFollowups.toString(), 'FollowUps', 'scrub must read the FollowUps sheet');
+});
+
+// ─── stale-draft purge (2026-06-20-purge-stale) ─────────────────────────────
+// One-time cleanup: delete unsent drafts older than N days (default 5). Source-introspection per
+// finding #14 (Gmail-dependent → assert structure, not behavior). Pins the 5-day default + the
+// age-boundary safety (KEEP newer than cutoff) + the capped/resumable execute.
+test('purgestale_defined_whitelisted_and_guarded', ['purge_stale', 'regression'], function() {
+  assertTrue(typeof menuPurgeStaleUnsentDrafts === 'function', 'purge must be defined');
+  assertContains(doGet.toString(), "'menuPurgeStaleUnsentDrafts'", 'purge must be whitelisted in admin_run');
+  var src = menuPurgeStaleUnsentDrafts.toString();
+  assertContains(src, 'getDrafts', 'must scan Gmail drafts');
+  assertContains(src, 'getDate', 'must filter by draft creation date');
+  assertContains(src, 'DAYS = 5', 'default threshold must be the 5-day rule');
+  assertContains(src, '>= cutoffMs', 'newer-than-cutoff drafts must be KEPT (age safety boundary)');
+  assertContains(src, 'deleteDraft', 'execute mode must delete');
+  assertContains(src, 'MAX_DELETE', 'execute must be capped/resumable');
+});
+
+// ─── lead-phone compilation (2026-06-20-leadphones) ─────────────────────────
+// Surface the only legitimately-owned phones (Sheet1 H captures + reply signatures) into a data sheet.
+test('leadphones_defined_whitelisted_dual_source', ['leadphones', 'regression'], function() {
+  assertTrue(typeof menuCompileLeadPhones === 'function', 'compiler must be defined');
+  assertContains(doGet.toString(), "'menuCompileLeadPhones'", 'compiler must be whitelisted in admin_run');
+  var src = menuCompileLeadPhones.toString();
+  assertContains(src, "getSheetByName('Sheet1')", 'must read Sheet1 (captured phones in col H)');
+  assertContains(src, 'reply_signature', 'must include the reply-signature source');
+  assertContains(src, 'LeadPhones', 'must write the LeadPhones data sheet');
+});
+test('leadphones_phone_normalizer', ['leadphones', 'regression'], function() {
+  assertTrue(_phNormalizeIndian_('+91-9876543210') === '+91 98765 43210', 'normalizes a +91 Indian mobile');
+  assertTrue(_phNormalizeIndian_('98765 43210') === '+91 98765 43210', 'normalizes a bare 10-digit mobile');
+  assertTrue(_phNormalizeIndian_('+91-[VERIFY]') === '', 'rejects our own [VERIFY] placeholder');
+  assertTrue(_phNormalizeIndian_('12345') === '', 'rejects too-short junk');
+});
+test('leadphones_reply_extractor_ignores_quote', ['leadphones', 'regression'], function() {
+  // The phone must come from the lead's NEW text, never the quoted original (which carries our signature).
+  var reply = 'Thanks Gaurav.\n\nBest,\nPriya\n+91 98765 43210\n\nOn Mon, Gaurav wrote:\n> reach me at +91 91111 22222';
+  assertTrue(_phExtractFromReply_(reply) === '+91 98765 43210', 'pulls the lead signature, not the quote');
+  assertTrue(_phExtractFromReply_('no number\n\nOn Mon wrote:\n> +91 93333 44444') === '', 'ignores phone in quoted original only');
+});
+test('leadphones_type_and_testfilter', ['leadphones', 'regression'], function() {
+  assertTrue(_phType_('+91 98765 43210') === 'mobile_IN', 'classifies an Indian mobile');
+  assertTrue(_phType_('914445614700') === 'landline_IN', 'classifies an Indian landline (STD 2-5)');
+  assertTrue(_phType_('12032998000') === 'intl_US', 'classifies a US/intl number');
+  assertTrue(_phIsTestLead_('e2e-test@automail-e2e.example', '') === true, 'flags an .example test email');
+  assertTrue(_phIsTestLead_('rakhi.singh4@flipkart.com', 'Rakhi Singh') === false, 'keeps a real lead');
+});
+
+// ─── user-locked email tests (2026-06-19-email-lock) ────────────────────────
+// A human-confirmed address ([EMAIL_LOCKED:<addr>] in NOTES) must be trusted verbatim by
+// the finalizer — skipping re-derivation, which would re-pick the same wrong guess and,
+// with the hold gate bypassed, draft to it. This is the safe bridge for held VERIFY_EMAIL leads.
+test('emaillock_extracts_valid_locked_address', ['email_lock', 'regression'], function() {
+  assertTrue(_extractLockedEmail_({ notes: 'foo [EMAIL_LOCKED:bhavya.sharma@flipkart.com] bar' }) === 'bhavya.sharma@flipkart.com',
+    'must extract the locked address from NOTES');
+  assertTrue(_extractLockedEmail_({ notes: '[EMAIL_LOCKED: Aditi.Bajaj@PepsiCo.com ]' }) === 'aditi.bajaj@pepsico.com',
+    'must trim + lowercase the locked address');
+});
+test('emaillock_returns_empty_without_valid_lock', ['email_lock', 'regression'], function() {
+  assertTrue(_extractLockedEmail_({ notes: 'no marker here' }) === '', 'no marker → empty');
+  assertTrue(_extractLockedEmail_({ notes: '[EMAIL_LOCKED:not-an-email]' }) === '', 'malformed address → empty');
+  assertTrue(_extractLockedEmail_({}) === '', 'no notes → empty');
+  assertTrue(_extractLockedEmail_({ notes: '[EMAIL_LOCKED:x@placeholder.invalid]' }) === '', 'placeholder → empty');
+});
+test('emaillock_finalizer_short_circuits_on_lock', ['email_lock', 'regression'], function() {
+  var src = finalizeEmailSelection.toString();
+  assertContains(src, '_extractLockedEmail_', 'finalizer must consult the user lock');
+  // the lock check must appear BEFORE the sheet-email precedence (highest precedence)
+  assertTrue(src.indexOf('_extractLockedEmail_') < src.indexOf('SHEET-EMAIL PRECEDENCE'),
+    'lock short-circuit must run before sheet-email precedence (highest precedence)');
+});
+test('emaillock_correct_promote_defined_and_whitelisted', ['email_lock', 'regression'], function() {
+  assertTrue(typeof menuCorrectAndPromoteEmail === 'function', 'menuCorrectAndPromoteEmail must be defined');
+  assertContains(doGet.toString(), "'menuCorrectAndPromoteEmail'", 'must be whitelisted in admin_run');
+  assertContains(menuCorrectAndPromoteEmail.toString(), 'EMAIL_LOCKED',
+    'correct+promote must write the [EMAIL_LOCKED] marker the finalizer honours');
+});
+test('emaillock_durable_store_roundtrips_and_beats_empty_notes', ['email_lock', 'regression'], function() {
+  // The Vedansh fix: a durable lock must be honoured even when NOTES has been wiped.
+  var probeRow = 990001;
+  try {
+    assertTrue(_emailLockSet_(probeRow, 'Test.User@Acme.com') === true, 'durable set returns true');
+    assertTrue(_emailLockGet_(probeRow) === 'test.user@acme.com', 'durable get returns lowercased lock');
+    assertTrue(_extractLockedEmail_({ rowNum: probeRow, notes: '' }) === 'test.user@acme.com',
+      'finalizer reads the DURABLE lock even with empty NOTES (notes-rewrite can no longer wipe it)');
+    assertTrue(_emailLockSet_(probeRow, 'not-an-email') === false, 'durable set rejects a malformed address');
+    _emailLockClear_(probeRow);
+    assertTrue(_emailLockGet_(probeRow) === '', 'durable clear removes the lock');
+  } finally { try { _emailLockClear_(probeRow); } catch (_) {} }
+});
+test('emaillock_correct_promote_persists_durably', ['email_lock', 'regression'], function() {
+  assertContains(menuCorrectAndPromoteEmail.toString(), '_emailLockSet_',
+    'correct+promote must persist the lock to the DURABLE store, not only NOTES');
+});
+
+// ─── email-accuracy SHADOW logic tests (2026-06-19-email-accuracy, Track B) ──
+// The current-employer-domain anchor: an off-domain pick (bistro.sk for someone at Flipkart)
+// must lose to / be corrected toward the current-employer address. These pin the pure core.
+test('emailaccuracy_domain_matches_company', ['email_accuracy', 'regression'], function() {
+  assertTrue(_domainMatchesCompany_('flipkart.com', 'Flipkart') === true, 'flipkart.com matches Flipkart');
+  assertTrue(_domainMatchesCompany_('pepsico.com', 'PepsiCo') === true, 'pepsico.com matches PepsiCo');
+  assertTrue(_domainMatchesCompany_('bistro.sk', 'Flipkart') === false, 'bistro.sk must NOT match Flipkart (the bug)');
+  assertTrue(_domainMatchesCompany_('reckitt.com', 'PepsiCo') === false, 'reckitt.com must NOT match PepsiCo');
+  assertTrue(_domainMatchesCompany_('gmail.com', '') === false, 'empty company never matches');
+});
+test('emailaccuracy_email_domain_extraction', ['email_accuracy', 'regression'], function() {
+  assertTrue(_emailDomainOf_('Bhavya.Sharma@Flipkart.com') === 'flipkart.com', 'lowercased domain');
+  assertTrue(_emailDomainOf_('no-at-sign') === '', 'no @ → empty');
+});
+test('emailaccuracy_resolves_current_domain_from_apk_email', ['email_accuracy', 'regression'], function() {
+  // APK email on the current employer → that domain anchors selection.
+  var r = _resolveCurrentEmployerDomain_({ organization: 'Flipkart', email: 'bhavya.sharma@flipkart.com' });
+  assertTrue(r.domain === 'flipkart.com', 'anchor domain = flipkart.com from the APK email matching the org');
+});
+test('emailaccuracy_rejects_ex_employer_domain', ['email_accuracy', 'regression'], function() {
+  // Headline lists an ex-employer (Bistro) but org is Flipkart; an APK email on bistro.sk must
+  // NOT become the anchor — it does not match the current employer.
+  var r = _resolveCurrentEmployerDomain_({ organization: 'Flipkart',
+    headline: 'Flipkart | Ex Product @Bistro', email: 'bhavya.sharma@bistro.sk' });
+  assertTrue(r.domain !== 'bistro.sk', 'ex-employer domain must never anchor the current employer');
+});
+test('emailaccuracy_shadow_corrects_offdomain_pick', ['email_accuracy', 'regression'], function() {
+  // The Bhavya case: APK=flipkart.com (right), enriched=bistro.sk (wrong) → shadow picks flipkart.com.
+  var p = _shadowPickEmail_({ fullName: 'Bhavya Sharma', organization: 'Flipkart',
+    email: 'bhavya.sharma@flipkart.com', enrichedEmail: 'bhavya.sharma@bistro.sk' }, false);
+  assertTrue(p.currentDomain === 'flipkart.com', 'current domain resolved to flipkart.com');
+  assertTrue(p.shadowEmail === 'bhavya.sharma@flipkart.com', 'shadow picks the current-employer address');
+  assertTrue(p.verdict === 'WOULD_CHANGE', 'an off-domain pick must be flagged WOULD_CHANGE');
+});
+test('emailaccuracy_shadow_holds_when_no_domain', ['email_accuracy', 'regression'], function() {
+  // No org/headline/APK signal → cannot resolve a current domain → would HOLD, never guess.
+  var p = _shadowPickEmail_({ fullName: 'Jane Doe', organization: '', email: 'jane@gmail.com',
+    enrichedEmail: 'jane.doe@somewhere.com' }, false);
+  assertTrue(p.verdict === 'WOULD_HOLD', 'no resolvable current domain → WOULD_HOLD (VERIFY_EMAIL)');
+});
+test('emailaccuracy_shadow_diag_defined_and_whitelisted', ['email_accuracy', 'regression'], function() {
+  assertTrue(typeof menuShadowEmailDiff === 'function', 'menuShadowEmailDiff must be defined');
+  assertContains(doGet.toString(), "'menuShadowEmailDiff'", 'shadow diagnostic must be whitelisted in admin_run');
 });
 
 // Menu helper — called from Code.gs onOpen menu construction

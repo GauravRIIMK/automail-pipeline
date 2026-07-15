@@ -55,6 +55,12 @@ function createDraft(lead, subjectLine, emailBody, metadata) {
   }
   __lat('validate_inputs');
 
+  // NOTE (2026-06-23, F3 email-core): the [VERIFY] subject-prefix decision used to
+  // live HERE (pre-PSV) and read only metadata.riskFlags. It now runs AFTER the PSV
+  // block (search "F3 email-core" below) so it also honors any flag PSV adds —
+  // specifically verify_recipient_before_send on an unconfirmed-deliverability
+  // (catch-all / unknown / blocker) address. See the moved block after __lat('psv').
+
   // Check daily draft limit to protect deliverability
   var dailyCheck = _checkDailyDraftLimit();
   if (dailyCheck.exceeded) {
@@ -97,12 +103,29 @@ function createDraft(lead, subjectLine, emailBody, metadata) {
     } catch (_) {}
     lead._psvRetryCount = previousRetryCount;
 
+    // PATCH 2026-06-23 (F3 email-core, kill-switch): the F3 behavior — adding
+    // verify_recipient_before_send on an unconfirmed-deliverability draft so the
+    // [VERIFY] subject prefix fires — is ON by default but can be disabled via
+    // ScriptProperty PSV_VERIFY_FLAG_ENABLED='0' if it proves too noisy on
+    // catch-all-heavy domains. Disabling reverts to the pre-F3 advisory-only PSV.
+    var _psvVerifyFlagOn = true;
+    try { _psvVerifyFlagOn = (PropertiesService.getScriptProperties().getProperty('PSV_VERIFY_FLAG_ENABLED') !== '0'); } catch (_) {}
+
     var psv;
     try { psv = preSendVerify(cleanEmail, lead); }
     catch (psvErr) {
       Logger.log('[GmailDrafter] PSV threw — failing open: ' + psvErr.message);
       psv = { ok: true, confidence: 50, reasons: ['PSV_ERROR_SKIPPED'], blockers: [], retryAfterMs: null,
               attemptCount: previousRetryCount };
+      // F3: a PSV runtime error means deliverability is UNCONFIRMED — flag it so the
+      // operator glances at the recipient (honors no-hold: still drafts + proceeds).
+      // Gated by the kill-switch. Closes the fail-open gap the adversarial review found.
+      if (_psvVerifyFlagOn) {
+        lead.riskFlags = lead.riskFlags || [];
+        if (lead.riskFlags.indexOf('verify_recipient_before_send') < 0) {
+          lead.riskFlags.push('verify_recipient_before_send');
+        }
+      }
     }
     Logger.log('[GmailDrafter] PSV ' + cleanEmail + ': ok=' + psv.ok +
                ' conf=' + psv.confidence + ' attempt=' + (previousRetryCount + 1) +
@@ -149,21 +172,46 @@ function createDraft(lead, subjectLine, emailBody, metadata) {
       // Propagate PSV verdict to the lead's riskFlags so the body-header
       // injector escalates the warning panel colour (low_confidence → red).
       lead.riskFlags = lead.riskFlags || [];
+      var _psvBlockerPresent = (psv.blockers || []).length > 0;
+      // PATCH 2026-06-23 (Phase A — catch-all resolution, decreases [VERIFY] noise):
+      // a PSV failure that is ONLY a low composite (catch-all / unknown — NO hard
+      // blocker) on a CORROBORATED address (the selector reached the verified tier,
+      // conf>=0.55, from real source/pattern/name agreement) is NOT a true risk: on a
+      // catch-all domain SMTP literally cannot confirm the mailbox, so confidence rightly
+      // rests on source agreement, never a meaningless SMTP "accept". Suppressing the
+      // [VERIFY] flag here removes the BULK of the catch-all flag noise WITHOUT re-exposing
+      // the dangerous wrong-DOMAIN case — that is still caught independently by the
+      // org-mismatch path (Stage 6.9/6.95 → org_recipient_mismatch, which is in the
+      // riskFlags union the [VERIFY] prefix reads). Hard blockers (invalid/disabled/
+      // spamtrap/disposable) are NEVER suppressed.
+      var _corroboratedCatchAll = !_psvBlockerPresent && (lead.selectionTier === 'verified');
       var psvFlagAdded = false;
-      if ((psv.blockers || []).length > 0) {
+      if (_psvBlockerPresent) {
         if (lead.riskFlags.indexOf('psv_blocker_' + psv.blockers[0]) < 0) {
           lead.riskFlags.push('psv_blocker_' + psv.blockers[0]);
           psvFlagAdded = true;
         }
-      } else if (psv.confidence < 50) {
+      } else if (psv.confidence < 50 && !_corroboratedCatchAll) {
         if (lead.riskFlags.indexOf('psv_low_confidence_' + psv.confidence) < 0) {
           lead.riskFlags.push('psv_low_confidence_' + psv.confidence);
           psvFlagAdded = true;
         }
       }
-      // If the lead was Tier 0 verified but PSV disputed, downgrade tier
-      // so the body-header panel actually renders. (Verified tier suppresses
-      // the panel entirely; this PSV signal is too important to hide.)
+      // F3: a PSV failure means deliverability is UNCONFIRMED → raise
+      // verify_recipient_before_send so the [VERIFY] subject prefix fires (applied
+      // post-PSV below). Gated by the PSV_VERIFY_FLAG_ENABLED kill-switch (default ON)
+      // AND suppressed for a corroborated catch-all (Phase A).
+      if (_psvVerifyFlagOn && !_corroboratedCatchAll &&
+          lead.riskFlags.indexOf('verify_recipient_before_send') < 0) {
+        lead.riskFlags.push('verify_recipient_before_send');
+      }
+      if (_corroboratedCatchAll) {
+        logPipelineEvent(lead.rowNum, 'DRAFT',
+          'PSV catch-all/unknown unconfirmable but address is corroborated (tier=verified, no hard blocker) — no [VERIFY] flag (Phase A)', 'INFO');
+      }
+      // If the lead was Tier 0 verified but PSV disputed, downgrade tier so the
+      // body-header panel renders. Only when we actually flagged (never for a
+      // suppressed corroborated catch-all).
       if (psvFlagAdded && lead.selectionTier === 'verified') {
         lead.selectionTier = 'low_confidence';
       }
@@ -176,6 +224,34 @@ function createDraft(lead, subjectLine, emailBody, metadata) {
     }
   }
   __lat('psv');
+
+  // PATCH 2026-06-23 (F3 email-core): compute the non-deletable [VERIFY] SUBJECT
+  // prefix HERE — AFTER PSV has run — from the UNION of metadata.riskFlags and
+  // lead.riskFlags. Previously this ran BEFORE PSV and read only metadata, so a
+  // PSV-added flag (verify_recipient_before_send, above) or any flag pushed onto
+  // lead.riskFlags after the pre-draft snapshot was silently dropped from the
+  // subject decision. The subject marker survives into the Gmail compose/send view,
+  // forcing a conscious glance at the recipient on manual send for wrong-company /
+  // low-confidence / org-mismatch / unconfirmed-deliverability drafts. Honors
+  // no-hold (still drafts + proceeds; nothing parked). Verified, PSV-clean drafts
+  // (no verify flag) are untouched.
+  try {
+    var _vfFlags = []
+      .concat((metadata && metadata.riskFlags) || [])
+      .concat((lead && lead.riskFlags) || []);
+    var _vfNeedsVerify = ((_vfFlags.indexOf('verify_recipient_before_send') >= 0) ||
+                         (_vfFlags.indexOf('org_recipient_mismatch') >= 0) ||
+                         (_vfFlags.indexOf('email_disagreement') >= 0) ||
+                         // 2026-06-24-org-arbitration: org came from Apollo (unconfirmed) or
+                         // Vision↔Apollo disagreed — survives the finalizer's riskFlags overwrite
+                         // on a separate field. Forces [VERIFY] independent of the email tier.
+                         (lead && lead.orgArbVerify === true))
+                         // 2026-06-24 DEMO: the owner-self showcase draft is exempt → clean subject.
+                         && !(lead && lead.isDemoSelf === true);
+    if (_vfNeedsVerify && !/^\s*\[VERIFY\]/i.test(String(subjectLine))) {
+      subjectLine = '[VERIFY] ' + subjectLine;
+    }
+  } catch (_vfErr) {}
 
   try {
     // ── Resolve resume attachment ──
@@ -492,13 +568,17 @@ function _fuPlainToHtml(text) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
-  // Split on blank-line boundaries (one or more blank lines)
+  // PATCH 2026-06-20-fu-format: style follow-up paragraphs to MATCH the cold email's body
+  // (Calibri/sans-serif, 14px, 1.6 line-height, #1a1a1a) and wrap in a styled container. The old
+  // output was bare <p> with NO font, so clients rendered it in their default serif font — looking
+  // unformatted next to the polished cold email. Content is unchanged; only styling is added.
+  var BODY = 'font-family:Calibri, Arial, Helvetica, sans-serif;font-size:14px;line-height:1.6;color:#1a1a1a;';
   var paragraphs = escaped.split(/\n{2,}/);
-  return paragraphs.map(function(para) {
+  var inner = paragraphs.map(function(para) {
     // Within each paragraph, single newlines → <br>
-    var inner = para.replace(/\n/g, '<br>');
-    return '<p style="margin:0 0 12px">' + inner + '</p>';
+    return '<p style="margin:0 0 14px 0;' + BODY + '">' + para.replace(/\n/g, '<br>') + '</p>';
   }).join('');
+  return '<div style="' + BODY + '">' + inner + '</div>';
 }
 
 /**
@@ -559,6 +639,101 @@ function _fuResolveThread(threadId, email, rfcMsgId) {
   return { thread: null, via: null };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX 2026-06-19-fu-recipient: address follow-ups to the LEAD, not to self.
+//
+// ROOT CAUSE (probed live via menuTestReplyTo): on a thread the pipeline STARTED
+// (every message is FROM the sender), GmailApp.createDraftReply / createDraftReplyAll
+// always address the SENDER (you) — and their `to` option is silently ignored. So
+// every follow-up reply was addressed to rathore.gaurav1007@gmail.com instead of the
+// lead, making follow-ups useless (they'd land in your own inbox).
+//
+// FIX: build the reply MIME ourselves and create it via the Gmail Advanced Service
+// (Gmail.Users.Drafts.create) with an explicit To: header + threadId for true in-thread
+// delivery to the lead. Scopes (gmail.modify + gmail.compose) are already granted, so
+// enabling the Advanced Service adds NO new OAuth scope and forces NO re-authorization.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Pure: true iff the follow-up recipient is the pipeline's own address (self-send).
+function _fuRecipientIsSelf_(toEmail, ownerEmail) {
+  var t = (toEmail || '').trim().toLowerCase();
+  var o = (ownerEmail || '').trim().toLowerCase();
+  return !!t && !!o && t === o;
+}
+
+// Pure: build an RFC822 multipart/alternative MIME string for a threaded reply
+// addressed to `toEmail`. base64-encodes the parts (clean UTF-8). Returns the raw
+// MIME (NOT yet base64url-wrapped — the caller does that for the Gmail API `raw` field).
+function _fuBuildRawMime_(fromHeader, toEmail, subject, inReplyToMsgId, plainText, htmlBody) {
+  var nl = '\r\n';
+  var boundary = 'fu_b_' + String(subject || 'x').replace(/[^a-zA-Z0-9]/g, '').substring(0, 10) + '_alt';
+  var headers = [];
+  if (fromHeader) headers.push('From: ' + fromHeader);
+  headers.push('To: ' + toEmail);
+  headers.push('Subject: ' + subject);
+  var mid = String(inReplyToMsgId || '').trim();
+  if (mid) {
+    if (mid.charAt(0) !== '<') mid = '<' + mid + '>';
+    headers.push('In-Reply-To: ' + mid);
+    headers.push('References: ' + mid);
+  }
+  headers.push('MIME-Version: 1.0');
+  headers.push('Content-Type: multipart/alternative; boundary="' + boundary + '"');
+
+  // RFC 2045: base64 lines must be ≤76 chars. GmailApp wraps automatically; this manual MIME must
+  // too — strict receiving clients reject an unwrapped part and fall back to plain text (a follow-up
+  // formatting cause). Short test inputs (< 76 chars) are unaffected.
+  function _b64w(s) { return String(s).replace(/(.{76})/g, '$1\r\n'); }
+  var b64Plain = _b64w(Utilities.base64Encode(plainText || ' ', Utilities.Charset.UTF_8));
+  var b64Html  = _b64w(Utilities.base64Encode(htmlBody  || ' ', Utilities.Charset.UTF_8));
+
+  var body =
+    '--' + boundary + nl +
+    'Content-Type: text/plain; charset="UTF-8"' + nl +
+    'Content-Transfer-Encoding: base64' + nl + nl +
+    b64Plain + nl +
+    '--' + boundary + nl +
+    'Content-Type: text/html; charset="UTF-8"' + nl +
+    'Content-Transfer-Encoding: base64' + nl + nl +
+    b64Html + nl +
+    '--' + boundary + '--';
+
+  return headers.join(nl) + nl + nl + body;
+}
+
+// Non-pure: create a threaded follow-up draft addressed to the LEAD via the Gmail
+// Advanced Service. Returns {ok, draftId, threadId, toEmail} or {ok:false, reason}.
+// NEVER throws — any failure (API disabled, self-address, empty email) → ok:false so
+// the follow-up DEFERS rather than creating a wrong draft or erroring the whole row.
+function _fuCreateThreadedDraftToLead_(threadGmailId, toEmail, subject, htmlBody, plainText, inReplyToMsgId, fromName) {
+  var lead = (toEmail || '').trim();
+  if (!lead) return { ok: false, reason: 'no_lead_email' };
+
+  var ownerEmail = '';
+  try { ownerEmail = (Session.getEffectiveUser().getEmail() || '').toLowerCase(); } catch (_) {}
+  if (_fuRecipientIsSelf_(lead, ownerEmail)) return { ok: false, reason: 'lead_equals_owner' };
+
+  if (typeof Gmail === 'undefined' || !Gmail || !Gmail.Users || !Gmail.Users.Drafts) {
+    return { ok: false, reason: 'gmail_advanced_service_unavailable' };
+  }
+
+  var fromHeader = ownerEmail ? ((fromName ? ('"' + fromName + '" ') : '') + '<' + ownerEmail + '>') : '';
+  var subj = String(subject || '');
+  if (!/^\s*re:/i.test(subj)) subj = 'Re: ' + subj;
+
+  try {
+    var mime = _fuBuildRawMime_(fromHeader, lead, subj, inReplyToMsgId, plainText, htmlBody);
+    var raw = Utilities.base64EncodeWebSafe(mime);
+    var resp = Gmail.Users.Drafts.create({ message: { raw: raw, threadId: threadGmailId } }, 'me');
+    var draftId = (resp && resp.id) || '';
+    var actualThreadId = (resp && resp.message && resp.message.threadId) || threadGmailId || '';
+    if (!draftId) return { ok: false, reason: 'no_draft_id_returned' };
+    return { ok: true, draftId: draftId, threadId: actualThreadId, toEmail: lead };
+  } catch (apiErr) {
+    return { ok: false, reason: 'gmail_api_error: ' + ((apiErr && apiErr.message) || apiErr) };
+  }
+}
+
 /**
  * Creates a threaded follow-up reply.
  *
@@ -570,8 +745,15 @@ function _fuResolveThread(threadId, email, rfcMsgId) {
  *   - When thread is found via rfc822 or email search, BACKFILLS col V THREAD_ID on
  *     the parent row (opportunistic, try/catch — same pattern as fcm-name backfill).
  *   - Body is converted from plain text to proper HTML via _fuPlainToHtml before
- *     tracking injection. thread.createDraftReply never receives options.subject
- *     (it inherits from the thread natively).
+ *     tracking injection.
+ *
+ * FIX 2026-06-19-fu-recipient:
+ *   - The reply is now created via _fuCreateThreadedDraftToLead_ (Gmail Advanced
+ *     Service) addressed to the LEAD. The old thread.createDraftReply call was a bug:
+ *     on a self-started thread it always addressed the SENDER (self), never the lead,
+ *     and ignored a `to` override (probed live 2026-06-19). If the lead-addressed draft
+ *     can't be created (Advanced Service off, empty/self email), the follow-up DEFERS
+ *     — it never falls back to a self-addressed draft.
  *
  * @param {Object} lead         - Lead object (uses lead.email, lead.rowNum, lead.threadId,
  *                                lead.rfc822MessageId, lead.linkedinUrl)
@@ -669,13 +851,28 @@ function createFollowUpDraft(lead, stage, subjectLine, emailBody, threadId) {
       }
     }
 
-    // ── Threaded reply — the ONLY draft-creation call ──
-    // createDraftReply inherits recipient + subject + In-Reply-To/References headers.
-    // Do NOT pass options.subject — thread inherits it natively.
-    var draft = thread.createDraftReply(_fuPlainText, {
-      htmlBody: trackedHtml,
-      name: 'Gaurav Rathore'
-    });
+    // ── Threaded reply addressed to the LEAD (FIX 2026-06-19-fu-recipient) ──
+    // GmailApp.createDraftReply was the bug: on a self-started thread it addresses
+    // the SENDER (you), not the lead, and ignores a `to` override (probed live). We
+    // now build the reply ourselves and create it via the Gmail Advanced Service with
+    // an explicit To: header + threadId. Subject comes from the thread (Gmail needs a
+    // matching subject to attach a draft to a thread).
+    var subjectForThread = '';
+    try { subjectForThread = thread.getFirstMessageSubject() || ''; } catch (_) { /* non-critical */ }
+
+    var created = _fuCreateThreadedDraftToLead_(
+      thread.getId(), cleanEmail, subjectForThread, trackedHtml, _fuPlainText, rfcMsgId, 'Gaurav Rathore');
+
+    if (!created.ok) {
+      // NEVER fall back to createDraftReply — that recreates the self-addressed bug.
+      // Defer instead: the follow-up retries next tick (and once the Gmail Advanced
+      // Service is enabled, it succeeds). reason 'lead_equals_owner' flags a bad row.
+      var deferMsg = 'Follow-up deferred — could not create lead-addressed threaded draft (' +
+                     created.reason + ')';
+      Logger.log('[GmailDrafter] ' + deferMsg + ' row=' + (lead.rowNum || 'n/a') + ' to=' + cleanEmail);
+      logPipelineEvent(lead.rowNum, 'FOLLOWUP_' + stage, deferMsg, 'WARN');
+      return { success: false, deferred: true, reason: created.reason };
+    }
 
     // Rate limit
     var delay = CONFIG.MIN_DELAY_BETWEEN_DRAFTS_MS || 3000;
@@ -683,11 +880,8 @@ function createFollowUpDraft(lead, stage, subjectLine, emailBody, threadId) {
 
     _incrementDailyDraftCount();
 
-    var draftId = draft.getId();
-    var actualThreadId = '';
-    try {
-      actualThreadId = draft.getMessage().getThread().getId();
-    } catch (_) { /* non-critical */ }
+    var draftId = created.draftId;
+    var actualThreadId = created.threadId || '';
 
     // Stamp thread_id onto the follow-up's tracking row so /exec?action=tracking_summary
     // returns the Gmail deep-link for this specific follow-up.
@@ -699,7 +893,7 @@ function createFollowUpDraft(lead, stage, subjectLine, emailBody, threadId) {
     }
 
     logPipelineEvent(lead.rowNum, 'FOLLOWUP_' + stage,
-                     'Follow-up draft created [threaded_reply via=' + threadVia + ']' +
+                     'Follow-up draft created [threaded_reply→lead=' + cleanEmail + ' via=' + threadVia + ']' +
                      (trackingId ? ' tracking=' + trackingId.substring(0, 8) : ''), 'SUCCESS');
 
     return { success: true, draftId: draftId, threadId: actualThreadId, error: '' };
@@ -3050,6 +3244,82 @@ function menuShowSheetCellUsage() {
                'Archive or truncate the largest tabs above to restore write capacity.');
   }
   return { totalCells: totalCells, limit: HARD_LIMIT, tabs: report };
+}
+
+/**
+ * Clear the historical `scanner_shadow_diff` tab to reclaim workbook cells.
+ *
+ * CONTEXT (2026-07-06-cellceiling-relief): the Phase-5.2a scanner shadow window
+ * accumulated ~357K diff rows (~9.3M cells ≈ 93% of the 10,000,000-cell workbook
+ * hard limit), which silently freezes ALL intake appendRow. The shadow compare
+ * only appends when CONFIG.USE_LEGACY_SCANNER !== false (BatchProcessor.gs:3561);
+ * the flag is now `false` (new scanner promoted), so these rows are DEAD history
+ * that will NOT refill — _ensureShadowDiffSheet only re-adds a 1-row header on the
+ * next scan. menuTrimPipelineLog does NOT touch this tab (it targets PipelineLog).
+ *
+ * SAFETY: (1) refuses to run while the shadow window is still active
+ * (USE_LEGACY_SCANNER !== false) so it can never discard in-flight comparison
+ * data; (2) operates ONLY on the hardcoded 'scanner_shadow_diff' tab; (3) uses
+ * deleteSheet + insertSheet (with the header preserved) because clearContents
+ * would keep the 357K×26 physical grid and NOT reclaim any cells.
+ *
+ * @returns {Object} { status, existed, beforeCells, afterCells, reclaimed, ... }
+ */
+function menuClearScannerShadowDiff() {
+  var SHEET = 'scanner_shadow_diff';
+  var ssId = (typeof CONFIG !== 'undefined' && CONFIG.SHEET_ID) ? CONFIG.SHEET_ID : null;
+  if (!ssId) { Logger.log('[ClearShadowDiff] CONFIG.SHEET_ID not set'); return { status: 'error', error: 'no_sheet_id' }; }
+
+  // SAFETY GATE: never clear while shadow mode may still be writing.
+  if (!(typeof CONFIG !== 'undefined' && CONFIG.USE_LEGACY_SCANNER === false)) {
+    Logger.log('[ClearShadowDiff] ABORT: USE_LEGACY_SCANNER is not false — shadow window may be active');
+    return { status: 'aborted', reason: 'shadow_window_active',
+             message: 'USE_LEGACY_SCANNER !== false; refusing to clear an active shadow-diff sheet.' };
+  }
+
+  var ss;
+  try { ss = SpreadsheetApp.openById(ssId); }
+  catch (e) { Logger.log('[ClearShadowDiff] openById failed: ' + e.message); return { status: 'error', error: e.message }; }
+
+  var sh = ss.getSheetByName(SHEET);
+  if (!sh) { Logger.log('[ClearShadowDiff] "' + SHEET + '" absent; nothing to clear'); return { status: 'ok', existed: false }; }
+
+  var beforeRows = sh.getMaxRows();
+  var beforeCols = sh.getMaxColumns();
+  var beforeCells = beforeRows * beforeCols;
+
+  // Preserve the header row so the summary endpoint + eager-init stay consistent.
+  var header = null;
+  try {
+    var lastCol = sh.getLastColumn();
+    if (sh.getLastRow() >= 1 && lastCol >= 1) header = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+  } catch (he) { header = null; }
+
+  // Delete + recreate: only deleteSheet/insertSheet actually shrinks the physical
+  // grid. Guard against the "cannot delete active sheet" edge by activating another.
+  try {
+    var others = ss.getSheets();
+    for (var i = 0; i < others.length; i++) {
+      if (others[i].getName() !== SHEET) { others[i].activate(); break; }
+    }
+  } catch (ae) { /* activation best-effort */ }
+
+  ss.deleteSheet(sh);
+  var fresh = ss.insertSheet(SHEET);
+  if (header && header.length) {
+    fresh.getRange(1, 1, 1, header.length).setValues([header]);
+  }
+
+  var afterCells = fresh.getMaxRows() * fresh.getMaxColumns();
+  var result = {
+    status: 'ok', existed: true,
+    beforeRows: beforeRows, beforeCols: beforeCols, beforeCells: beforeCells,
+    afterCells: afterCells, reclaimed: beforeCells - afterCells,
+    headerRestored: !!(header && header.length)
+  };
+  Logger.log('[ClearShadowDiff] Recreated "' + SHEET + '": ' + beforeCells + ' -> ' + afterCells +
+             ' cells (reclaimed ' + result.reclaimed + ')');
+  return result;
 }
 
 // ─── DRAFT RETRIEVAL HELPERS ───────────────────────────────

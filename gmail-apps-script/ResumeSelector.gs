@@ -684,7 +684,7 @@ function getResumeHighlights(variantId) {
   var highlights = {
     GROWTH_MARKETING: [
       'Built GTM for 38 dark stores driving 15% YoY expansion and doubling DAUs across 5 cities',
-      'Scaled referral program from 0 to Rs 15 Cr in 4 months via ABM and MarTech',
+      'Scaled referral program from 0 to Rs 1.5 Cr in 4 months via ABM and MarTech',
       'Architected AI-powered B2B email system cutting drafting time by 85% across 8 MarTech tools',
       'Cut marketing costs by 40% via hyperlocal BTL site selection framework',
       'Improved APAC lead conversion by 25% and reduced CAC by 30% through predictive scoring and A/B testing'

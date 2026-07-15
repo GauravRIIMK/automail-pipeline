@@ -316,6 +316,36 @@ function _parseBounceMessage(msg) {
   };
 }
 
+// PATCH 2026-06-17-bounce-classify (Feature 2): a hard bounce isn't one thing.
+// Classify the SMTP enhanced code + NDR text so the note carries a *recommended
+// action* — because the right response differs by cause:
+//   • recipient_side (5.4.x routing loop / 5.2.x full / greylist) → NOT a wrong
+//     address; do NOT retry the same address — switch channel (LinkedIn).
+//   • no_such_user (5.1.1 / "user unknown") → the mailbox is wrong → try an
+//     alternate format / verify, then re-inject (re-scanning won't retry it).
+//   • policy_block (5.7.x / spam) → reputation/policy issue; the address may be fine.
+// Pure function (testable). Status stays BOUNCED_<category> (no auto-retry — that
+// would re-send to a likely-bad address); the guidance goes in NOTES.
+function _classifyBounceReason(parsed) {
+  var hay = (((parsed && parsed.statusCode) || '') + ' ' +
+             ((parsed && parsed.reason) || '') + ' ' +
+             ((parsed && parsed.subject) || '')).toLowerCase();
+  if (/5\.4\.|routing loop|too many hops|mail loop|5\.2\.|mailbox full|over ?quota|quota exceeded|insufficient storage|greylist/.test(hay)) {
+    return { klass: 'recipient_side',
+      action: 'Recipient mail server refused delivery (routing loop / full mailbox / greylist) — NOT necessarily a wrong address. Do not retry the same address; reach them on LinkedIn.' };
+  }
+  if (/5\.1\.1|no such (user|recipient|mailbox)|user unknown|unknown user|mailbox (unavailable|not found|does not exist)|recipient (address )?rejected|address (rejected|not found|invalid)|user does not exist/.test(hay)) {
+    return { klass: 'no_such_user',
+      action: 'Address does not exist — try an alternate format (first@, firstlast@) or verify the real address, then re-inject. Re-scanning will NOT retry it.' };
+  }
+  if (/5\.7\.|spam|blocked|blacklist|policy|reputation|denied by policy/.test(hay)) {
+    return { klass: 'policy_block',
+      action: 'Recipient blocked on spam/policy grounds — the address may be valid; improve sender reputation or use another channel.' };
+  }
+  return { klass: (parsed && parsed.category) || 'other',
+    action: 'Undeliverable — treat the address as bad; verify it or use another channel.' };
+}
+
 /**
  * If a bounced email matches a Sheet2 row, mark that row's status BOUNCED.
  * Best-effort: silent on failure, never blocks the main bounce scan.
@@ -335,6 +365,10 @@ function _markLeadRowBounced(ss, parsed) {
   var width = CONFIG.SHEET_COL_COUNT || 26;
   var allRows = sheet.getRange(2, 1, lastRow - 1, width).getValues();
   var target = parsed.email.toLowerCase();
+  // G3 (2026-06-22): record the exact bounced address to the durable store so the
+  // selector never re-drafts it (even via a different lead row). Recorded
+  // regardless of whether a lead row matches below — the address bounced either way.
+  try { _recordBouncedAddress(parsed.email, parsed.category); } catch (_) {}
 
   for (var i = 0; i < allRows.length; i++) {
     var r = allRows[i];
@@ -343,9 +377,17 @@ function _markLeadRowBounced(ss, parsed) {
     if (sheetEmail === target || enriched === target) {
       var rowNum = i + 2;
       sheet.getRange(rowNum, statusCol).setValue('BOUNCED_' + parsed.category.toUpperCase());
+      // PATCH 2026-06-17-bounce-classify: annotate the note with the bounce CLASS
+      // + the recommended action, so the user knows whether to retry an alternate
+      // address (no_such_user) or switch channel (recipient_side). Status stays
+      // BOUNCED_<category> — no silent auto-retry to a likely-bad address.
+      var _bcls = (typeof _classifyBounceReason === 'function')
+        ? _classifyBounceReason(parsed) : { klass: parsed.category, action: '' };
       var existingNotes = (r[notesCol - 1] || '') + '';
-      var bounceNote = '[BOUNCE ' + parsed.timestamp.substring(0, 10) +
-                       ' ' + parsed.category + ' ' + parsed.statusCode + '] ' + parsed.reason;
+      var bounceNote = '[BOUNCE ' + parsed.timestamp.substring(0, 10) + ' ' + parsed.category +
+                       (_bcls.klass && _bcls.klass !== parsed.category ? '/' + _bcls.klass : '') +
+                       ' ' + parsed.statusCode + '] ' + parsed.reason +
+                       (_bcls.action ? ' → ' + _bcls.action : '');
       sheet.getRange(rowNum, notesCol).setValue(
         (existingNotes ? existingNotes + ' | ' : '') + bounceNote
       );
@@ -390,6 +432,34 @@ function getBouncedDomainsSnapshot() {
     try { var m = JSON.parse(raw); return { domains: m, count: Object.keys(m).length, source: 'property_fallback' }; }
     catch (_) { return { domains: {}, count: 0, error: e.message }; }
   }
+}
+
+// ─── G3 per-address bounce suppression (2026-06-22) ────────────────────────
+// Durable store of the EXACT addresses that bounced, so the selector never
+// re-drafts a previously-bounced mailbox (even if it arrives via a different
+// lead row / LinkedIn slug). Bounced addresses are few; a ScriptProperty JSON
+// map stays well within the 9KB cap.
+var BOUNCED_ADDRESSES_PROPERTY = 'bouncedAddresses';
+function _recordBouncedAddress(email, category) {
+  try {
+    var key = ((email || '') + '').toLowerCase().trim();
+    if (!key) return;
+    var props = PropertiesService.getScriptProperties();
+    var raw = props.getProperty(BOUNCED_ADDRESSES_PROPERTY);
+    var map = raw ? JSON.parse(raw) : {};
+    var e = map[key] || { hard: 0, soft: 0 };
+    if (((category || '') + '').toLowerCase() === 'hard') { e.hard = (e.hard || 0) + 1; }
+    else { e.soft = (e.soft || 0) + 1; }
+    e.lastSeen = new Date().toISOString().substring(0, 10);
+    map[key] = e;
+    props.setProperty(BOUNCED_ADDRESSES_PROPERTY, JSON.stringify(map));
+  } catch (_) {}
+}
+function getBouncedAddressesMap() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(BOUNCED_ADDRESSES_PROPERTY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (_) { return {}; }
 }
 
 // ─── Sheet-backed bouncedDomains store (Patch 2026-05-12) ──────────────────

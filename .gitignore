@@ -65,3 +65,12 @@ Thumbs.db
 
 # ─── Claude Code local settings ──────────────────────────────
 .claude/
+
+# ─── Credential-bearing file classes (2026-07-16) ────────────
+# These leaked real keys once. Deploy runbooks paste admin tokens and
+# deployment IDs inline; one-shot Setup*Key* scripts hardcode a vendor key
+# by design and are meant to be deleted after running. Neither belongs here.
+DEPLOY_*.md
+RECOVERY_*.md
+gmail-apps-script/Setup*Key*.gs
+secretmap.json

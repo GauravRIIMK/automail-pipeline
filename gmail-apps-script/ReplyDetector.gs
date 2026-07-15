@@ -44,6 +44,13 @@ function processReplies() {
       return (bRaw && parseInt(bRaw, 10) > 0) ? parseInt(bRaw, 10) : REPLY_DAILY_GMAIL_OP_BUDGET;
     } catch (_) { return REPLY_DAILY_GMAIL_OP_BUDGET; }
   })();
+  // GLOBAL scan-reserve: yield if the two scanners' COMBINED metered ops have hit
+  // the reserve cap, so createDraft keeps its share of the real (~3.8K) ceiling.
+  if (typeof _gmScanReserveShouldYield === 'function' && _gmScanReserveShouldYield()) {
+    Logger.log('[ReplyDetector] global Gmail scan-reserve reached — skipping to protect draft creation');
+    return { status: 'skipped', reason: 'gmail_scan_reserve_reached',
+             threadsScanned: 0, newRepliesMarked: 0, skipped: 0, durationMs: Date.now() - startedAt };
+  }
   if (typeof _gmOpBudgetRemaining === 'function' && _gmOpBudgetRemaining('reply.scan', _replyBudget) <= 0) {
     Logger.log('[ReplyDetector] daily op budget ' + _replyBudget + ' reached — skipping to protect draft creation');
     return { status: 'skipped', reason: 'daily_op_budget_reached',

@@ -150,8 +150,49 @@ var EDGE_CASES = {
  *                            structure: { co: {stage, size}, triggers: [], ... }
  * @returns {Object} ClassificationResult
  */
+/**
+ * PATCH 2026-06-23 (archetype-override): pin or clear a per-lead archetype override.
+ * Use when a human knows the lead's function better than the scraped title (e.g. an
+ * ambiguous "Campus & Alternate Channels" title that is actually campus recruiting / HR).
+ * @param {number} rowNum     Sheet2 row of the lead.
+ * @param {string} archetype  'HR' / 'HR_RECRUITER' to force HR; '' / 'CLEAR' / 'NONE' to remove.
+ * @returns {Object} status + the resulting override map.
+ * Whitelisted in the admin_run bridge. Writes ONE ScriptProperty (ARCHETYPE_OVERRIDES) —
+ * never a mail send/delete op. Reprocess the lead (menuResetLeadToNew) to apply.
+ */
+function menuSetArchetypeOverride(rowNum, archetype) {
+  var rn = parseInt(rowNum, 10);
+  if (!rn) return { status: 'error', error: 'rowNum required' };
+  var props = PropertiesService.getScriptProperties();
+  var map = {};
+  try { map = JSON.parse(props.getProperty('ARCHETYPE_OVERRIDES') || '{}'); } catch (_) {}
+  var val = (archetype || '').toString().trim().toUpperCase();
+  if (!val || val === 'CLEAR' || val === 'NONE') {
+    delete map[String(rn)];
+  } else {
+    map[String(rn)] = (val === 'HR' || val === 'HR_RECRUITER') ? 'HR' : val;
+  }
+  props.setProperty('ARCHETYPE_OVERRIDES', JSON.stringify(map));
+  return { status: 'ok', rowNum: rn, archetype: map[String(rn)] || '(cleared)', overrides: map };
+}
+
 function classifyLead(lead, dossier) {
   try {
+    // PATCH 2026-06-23 (archetype-override): a human can PIN a lead's archetype when the
+    // SCRAPED TITLE is ambiguous and the title-based classifier would mis-route it — e.g.
+    // "Manager - Campus & Alternate Channels" is really campus RECRUITING (HR) but carries
+    // no HR keyword, so HR_TITLE_REGEX / _isHRRole both miss it. ScriptProperty
+    // ARCHETYPE_OVERRIDES = {"<rowNum>":"HR"} forces lead.isHR=true so the EXISTING HR
+    // routing (isHrByFlag in _detectEdgeCases) takes over — no scraped-data corruption,
+    // reusable for any future ambiguous lead. Set/clear via menuSetArchetypeOverride.
+    try {
+      if (lead && lead.rowNum != null) {
+        var _aoMap = JSON.parse(PropertiesService.getScriptProperties().getProperty('ARCHETYPE_OVERRIDES') || '{}');
+        var _aoVal = _aoMap[String(lead.rowNum)];
+        if (_aoVal === 'HR' || _aoVal === 'HR_RECRUITER') { lead.isHR = true; }
+      }
+    } catch (_aoErr) {}
+
     // Detect edge cases first
     var edgeCases = _detectEdgeCases(lead, dossier);
 

@@ -412,12 +412,18 @@ function _psvPatternCheck(email, lead, domain) {
   } catch (_) { return 0; }
 }
 
+var _psvBounceSnapshotMemo = null; // G7: per-execution memo of the BouncedDomains sheet
+
 function _psvGetHardBounceCount(domain) {
   try {
-    var raw = PropertiesService.getScriptProperties().getProperty('bouncedDomains');
-    if (!raw) return 0;
-    var map = JSON.parse(raw);
-    var entry = map[domain.toLowerCase()];
+    // G7 (2026-06-22): read the AUTHORITATIVE BouncedDomains sheet (memoized per
+    // execution), not the legacy top-50 ScriptProperty cache which silently missed
+    // any domain outside the top 50 (so a bad domain went unsuppressed pre-send).
+    if (!_psvBounceSnapshotMemo) {
+      _psvBounceSnapshotMemo = (typeof getBouncedDomainsSnapshot === 'function')
+        ? (getBouncedDomainsSnapshot().domains || {}) : {};
+    }
+    var entry = _psvBounceSnapshotMemo[(domain || '').toLowerCase()];
     return entry ? (entry.hard || 0) : 0;
   } catch (_) { return 0; }
 }

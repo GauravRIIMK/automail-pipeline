@@ -376,10 +376,21 @@ function fetchHunterPattern(domain) {
     return p.pattern || null;
   }
 
+  // ── VENDOR FAILOVER (-p5-vendorfailover): skip a known-exhausted Hunter ──
+  if (typeof vendorFailoverShouldSkip === 'function' && vendorFailoverShouldSkip('hunter')) {
+    Logger.log('[Sources/HunterPattern] hunter circuit OPEN — skipping domain-search');
+    return null;
+  }
+
   var url = 'https://api.hunter.io/v2/domain-search?domain=' + encodeURIComponent(domain) +
             '&limit=1&api_key=' + encodeURIComponent(apiKey);
   try {
     var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (typeof vendorFailoverRecord === 'function') {
+      var _hpBody = '';
+      try { _hpBody = res.getContentText(); } catch (_) {}
+      vendorFailoverRecord('hunter', res.getResponseCode(), _hpBody);
+    }
     if (res.getResponseCode() === 429) {
       Logger.log('[Sources/HunterPattern] quota exhausted (429)');
       return null;
@@ -785,23 +796,50 @@ function resolveLeadApolloMatch(linkedinUrl) {
     return cachedMatch.result;
   }
 
+  // ── VENDOR FAILOVER (-p5-vendorfailover) ─────────────────────────────────
+  // If Apollo's circuit is OPEN (credits exhausted / auth-failed), skip the
+  // live call entirely and return null. enrichEmail then falls through to the
+  // Hunter finder, then the pattern+Reoon engine — automatic Apollo→Hunter
+  // failover. Cache hits above are still served (no API cost). Kill-switch:
+  // VENDOR_FAILOVER_ENABLED='0'.
+  if (typeof vendorFailoverShouldSkip === 'function' && vendorFailoverShouldSkip('apollo')) {
+    Logger.log('[Sources/ApolloMatch] apollo circuit OPEN — skipping live call; cascade falls through to Hunter/pattern');
+    return null;
+  }
+
   // Use the fallback-aware fetcher (handles 403 payment-block transparently)
   var res = _apolloFetchWithFallback(apiKey,
     'https://api.apollo.io/api/v1/people/match',
     JSON.stringify({ linkedin_url: linkedinUrl, reveal_personal_emails: true }));
 
+  var _apolloCode = res ? res.getResponseCode() : 0;
+  var _apolloBody = '';
+  if (res) { try { _apolloBody = res.getContentText(); } catch (_) {} }
+
+  // Breaker bookkeeping. Record FAILURES (403 payment / 429 quota) immediately so
+  // the circuit trips and the cascade fails over to Hunter. A SUCCESS is recorded
+  // ONLY after confirming a productive person record (below) — a 200 with no
+  // person must NOT reset an OPEN breaker, since an exhausted/quota-limited 200
+  // would otherwise read as a false recovery (review fix -p5-vendorfailover).
+  if (res && _apolloCode !== 200 && typeof vendorFailoverRecord === 'function') {
+    vendorFailoverRecord('apollo', _apolloCode, _apolloBody);
+  }
+
   try {
-    if (!res || res.getResponseCode() !== 200) {
-      Logger.log('[Sources/ApolloMatch] HTTP ' + (res ? res.getResponseCode() : 'no_response'));
+    if (!res || _apolloCode !== 200) {
+      Logger.log('[Sources/ApolloMatch] HTTP ' + (res ? _apolloCode : 'no_response'));
       return null;
     }
-    var json = JSON.parse(res.getContentText());
+    var json = JSON.parse(_apolloBody);
     var person = json.person || null;
     if (!person) {
       Logger.log('[Sources/ApolloMatch] no person record for ' + linkedinUrl);
       _vendorCachePut(cacheKey, { result: null, ts: Date.now() }, 14 * 86400);
       return null;
     }
+    // Productive 200 (a real person came back) — Apollo demonstrably worked, so
+    // record success to recover a previously-OPEN circuit to HEALTHY.
+    if (typeof vendorFailoverRecord === 'function') vendorFailoverRecord('apollo', 200, '');
 
     // Pull the org domain from the org block or employment_history
     var domain = '';
@@ -1204,6 +1242,31 @@ function _snovBoostCorroboratesOrg(orgName, snovCompanyName, domain) {
 function resolveDomainContextual(orgName, contextHints) {
   if (!orgName) return null;
   contextHints = contextHints || {};
+
+  // Step 0 — MANUAL OVERRIDE (highest priority, 2026-07-07): curated org→domain map
+  // for companies whose real email domain is NOT derivable from the name slug
+  // (American Express → aexp.com, NOT the consumer site americanexpress.com). This
+  // MUST run before candidate-gathering because the _domainHasOrgOverlap filter below
+  // would drop aexp.com (shares zero tokens with "American Express"). MX-gated so a
+  // stale/bad override entry can't win; falls through to normal resolution if no MX.
+  if (typeof _resolveManualDomainOverride === 'function') {
+    var _ovrDomain = _resolveManualDomainOverride(orgName);
+    if (_ovrDomain) {
+      var _ovrMx = (typeof verifyMxRecord === 'function') ? verifyMxRecord(_ovrDomain) : { hasMx: true };
+      if (_ovrMx && _ovrMx.hasMx) {
+        Logger.log('[Sources/Contextual] ' + orgName + ' → ' + _ovrDomain + ' (MANUAL OVERRIDE, highest priority)');
+        return {
+          domain: _ovrDomain,
+          confidence: 0.95,
+          sources: ['manual_override'],
+          snovPresence: null,
+          apolloMeta: null,
+          allCandidates: [{ domain: _ovrDomain, score: 0.95, sources: ['manual_override'] }]
+        };
+      }
+      Logger.log('[Sources/Contextual] manual override ' + _ovrDomain + ' has NO MX — ignoring, normal resolution');
+    }
+  }
 
   // Step 1: ask Apollo orgs — most reliable disambiguation (multiple results sorted by Apollo's own internal ranking + our context scoring)
   var apolloOrgs = resolveDomainApolloOrgs(orgName, contextHints);

@@ -68,8 +68,8 @@ function menuShowGmailOpsMeter() {
   });
   byTag.sort(function(a, b) { return b[1] - a[1]; });
 
-  Logger.log('=== GMAIL OPS METER — PT day ' + today + ' (pool ~20,000/day consumer; resets midnight PT = 12:30 PM IST) ===');
-  Logger.log('Metered total today: ' + total + '  (' + (total / 200).toFixed(1) + '% of 20K — instrumented sites only, not all Gmail usage)');
+  Logger.log('=== GMAIL OPS METER — PT day ' + today + ' (★observed ceiling ~3.8-4K/day for THIS account — the "20K pool" was a myth, live createDraft failed at ~3,812; resets midnight PT = 12:30 PM IST) ===');
+  Logger.log('Metered total today: ' + total + '  (~' + (total / 38).toFixed(0) + '% of the observed ~3.8K ceiling — instrumented SCAN sites only; drafts + other Gmail calls are unmetered but ALSO consume the same ceiling)');
   byTag.forEach(function(t) { Logger.log('  ' + t[0] + ': ' + t[1]); });
   if (pruned) Logger.log('(pruned ' + pruned + ' stale meter keys)');
   return { ptDate: today, total: total, byTag: byTag, pruned: pruned };

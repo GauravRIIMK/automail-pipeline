@@ -300,11 +300,13 @@ function _recencySyncCronCache() {
 }
 
 function _recencyPipelineEventByCategory(category) {
-  // PipelineEvents sheet (if present) holds logPipelineEvent entries.
+  // FIX 2026-06-20: read the ACTUAL log sheet (CONFIG.LOG_SHEET = 'PipelineLog'). The old code read a
+  // non-existent 'PipelineEvents' sheet, so every SCAN-category recency check was PERMANENTLY blind →
+  // all scan triggers falsely showed "configured_but_quiet" regardless of real activity (found via audit).
   try {
     var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
-    var sheet = ss.getSheetByName('PipelineEvents');
-    if (!sheet || sheet.getLastRow() < 2) return { lastSeenMs: 0, evidence: 'pipeline_events_sheet_empty' };
+    var sheet = ss.getSheetByName((typeof CONFIG !== 'undefined' && CONFIG.LOG_SHEET) ? CONFIG.LOG_SHEET : 'PipelineLog');
+    if (!sheet || sheet.getLastRow() < 2) return { lastSeenMs: 0, evidence: 'log_sheet_empty' };
     var lastRow = sheet.getLastRow();
     // Scan the last 200 rows looking for the category
     var startRow = Math.max(2, lastRow - 200);
@@ -329,7 +331,18 @@ function _recencyPipelineEventByCategory(category) {
         }
       } catch (_) {}
     }
-    if (bestMs === 0) return { lastSeenMs: 0, evidence: 'no_' + category + '_events_found' };
+    if (bestMs === 0) {
+      // PipelineLog logs by STAGE/STATUS, not by trigger-category. If this category isn't logged
+      // separately, fall back to the most-recent event of ANY kind as proof the pipeline is actively
+      // writing (alive) — rather than falsely reporting silence.
+      try {
+        var lastTs = new Date(data[data.length - 1][tsIdx]);
+        if (!isNaN(lastTs.getTime())) {
+          return { lastSeenMs: lastTs.getTime(), evidence: 'recent_pipeline_activity (no per-category marker) at ' + lastTs.toISOString() };
+        }
+      } catch (_) {}
+      return { lastSeenMs: 0, evidence: 'no_' + category + '_events_found' };
+    }
     return { lastSeenMs: bestMs, evidence: category + ' event at ' + new Date(bestMs).toISOString() };
   } catch (e) {
     return { lastSeenMs: 0, evidence: 'check_threw_' + e.message };

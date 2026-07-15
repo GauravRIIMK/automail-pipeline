@@ -761,8 +761,19 @@ function menuSendMailTesterDraft(rowNum) {
  * @returns {{requeued:number, rows:Array<{row,to,oldDraftId}>}}
  */
 function menuRequeueDegradedTodayDrafts() {
-  var WINDOW_START = new Date('2026-06-12T08:20:00Z').getTime();
-  var WINDOW_END   = new Date('2026-06-12T09:00:00Z').getTime();
+  // ★2026-06-29 rewrite: this WAS hardcoded to a 2026-06-12 08:20-09:00Z incident window
+  // (a one-shot tool whose name lied — it never tracked "today", so it requeued 0 on 06-29).
+  // Now it SELF-IDENTIFIES degraded drafts by note content: DRAFT_CREATED rows whose body
+  // fell back to the generic deterministic template because the Claude composer failed
+  // (NOTES contains 'claude_api_error' — typically a credit-exhaustion HTTP 400). Requeue
+  // (STATUS=NEW) so they recompose with REAL Claude content once credits are restored.
+  //   • DRAFT_CREATED-only → never touches SENT/REPLIED/DRAFT_DELETED (terminal/human-killed).
+  //   • Recent-only (LAST_UPDATED within RECENT_DAYS) → never resurrects ancient rows.
+  //   • Idempotent → sets STATUS=NEW, so a re-run finds nothing (no double-requeue).
+  // Reusable for the next outage.
+  var RECENT_DAYS = 7;
+  var cutoff = Date.now() - RECENT_DAYS * 24 * 3600 * 1000;
+  var MARKER = 'claude_api_error';
   var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
   var sheet = ss.getSheetByName(CONFIG.DATA_SHEET);
   if (!sheet) return { status: 'error', error: 'data sheet not found' };
@@ -772,35 +783,35 @@ function menuRequeueDegradedTodayDrafts() {
   if (lastRow < 2) return { requeued: 0, rows: [] };
   var data = sheet.getRange(2, 1, lastRow - 1, colCount).getValues();
   var requeued = 0;
+  var skippedStale = 0;
   var rows = [];
   var now = new Date().toISOString();
   for (var i = 0; i < data.length; i++) {
     var rowNum = i + 2;
-    var status      = String(data[i][C.STATUS       - 1] || '');
-    var draftId     = String(data[i][C.DRAFT_ID     - 1] || '').trim();
-    var lastUpdRaw  = data[i][C.LAST_UPDATED - 1];
-    var email       = String(data[i][C.EMAIL        - 1] || '');
+    var status = String(data[i][C.STATUS - 1] || '');
     if (status !== 'DRAFT_CREATED') continue;
-    var ts = 0;
-    try {
-      var d = (lastUpdRaw instanceof Date) ? lastUpdRaw : new Date(lastUpdRaw);
-      ts = d.getTime();
-    } catch (_) {}
-    if (!ts || ts < WINDOW_START || ts > WINDOW_END) continue;
-    // This row was created in the degraded-renderer window
     var notes = String(data[i][C.NOTES - 1] || '');
-    var newNotes = '[REQUEUE_BUILDERBLOCK] old draft ' + (draftId || 'unknown') + ' superseded; ' + notes;
+    if (notes.indexOf(MARKER) < 0) continue;   // not a Claude-degraded draft
+    // Recent-only guard (skip drafts whose generic body predates this outage window).
+    var lastUpdRaw = data[i][C.LAST_UPDATED - 1];
+    var ts = 0;
+    try { var d = (lastUpdRaw instanceof Date) ? lastUpdRaw : new Date(lastUpdRaw); ts = d.getTime(); } catch (_) {}
+    if (ts && ts < cutoff) { skippedStale++; continue; }
+    var draftId = String(data[i][C.DRAFT_ID - 1] || '').trim();
+    var email   = String(data[i][C.EMAIL - 1] || '');
+    var newNotes = '[REQUEUE_CLAUDE_RECOVER] old draft ' + (draftId || 'unknown') +
+                   ' superseded (was generic deterministic fallback; Claude recovered); ' + notes;
     if (newNotes.length > 1900) newNotes = newNotes.substring(0, 1900);
     sheet.getRange(rowNum, C.NOTES       ).setValue(newNotes);
     sheet.getRange(rowNum, C.DRAFT_ID    ).setValue('');
     sheet.getRange(rowNum, C.STATUS      ).setValue('NEW');
     sheet.getRange(rowNum, C.LAST_UPDATED).setValue(now);
     requeued++;
-    if (rows.length < 40) {
+    if (rows.length < 60) {
       rows.push({ row: rowNum, to: email, oldDraftId: draftId });
     }
   }
-  return { requeued: requeued, rows: rows };
+  return { requeued: requeued, skippedStale: skippedStale, marker: MARKER, recentDays: RECENT_DAYS, rows: rows };
 }
 
 /**
@@ -1849,4 +1860,1146 @@ function menuResetLeadToNew(a, _) {
     orphanedDraftId: oldDraft || '(none)',
     note: 'Reset to NEW; scanner will reprocess with current logic. Any previously-created Gmail draft is orphaned — delete it manually.'
   };
+}
+
+// PATCH 2026-06-18-draftsync-probe: definitively test whether stored DRAFT_IDs
+// still resolve via GmailApp.getDraft() — to distinguish a TRUE deletion from a
+// false DRAFT_DELETED caused by the syncer treating a transient getDraft() error
+// as "draft gone". argS = comma-separated draftIds. Returns per-id exists/error +
+// the live draft count + sample real ids (for format comparison). Read-only.
+function menuProbeDraftId(a, argS) {
+  var ids = String(argS || '').split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+  var out = { probed: [], ts: new Date().toISOString() };
+  ids.forEach(function(id) {
+    var r = { id: id, exists: false, error: '', to: '' };
+    try {
+      var d = GmailApp.getDraft(id);
+      r.exists = !!d;
+      if (d) { try { r.to = d.getMessage().getTo(); } catch (_) {} }
+    } catch (e) { r.error = (e && e.message) || String(e); }
+    out.probed.push(r);
+  });
+  try {
+    var all = GmailApp.getDrafts();
+    out.totalDrafts = all.length;
+    out.sampleRealIds = all.slice(0, 5).map(function(d) { return d.getId(); });
+  } catch (e) { out.draftsErr = (e && e.message) || String(e); }
+  return out;
+}
+
+// PATCH 2026-06-19-fu-recipient: probe HOW to address a follow-up reply to the LEAD
+// (not self). On a self-started thread, createDraftReply targets the sender (you).
+// Test (a) createDraftReply with a `to` override and (b) createDraftReplyAll, read
+// back each draft's actual To, then delete the probe drafts. argS = threadId.
+function menuTestReplyTo(a, argS) {
+  var threadId = String(argS || '').trim();
+  if (!threadId) return { status: 'error', error: 'argS=threadId required' };
+  var thread;
+  try { thread = GmailApp.getThreadById(threadId); } catch (e) { return { status: 'error', error: e.message }; }
+  if (!thread) return { status: 'error', error: 'thread not found: ' + threadId };
+  var out = { status: 'ok', threadId: threadId, tests: [] };
+  try {
+    var d1 = thread.createDraftReply('probe', { htmlBody: 'probe', to: 'fu-probe-a@example.com' });
+    var t1 = ''; try { t1 = d1.getMessage().getTo(); } catch (_) {}
+    out.tests.push({ method: 'createDraftReply+to', actualTo: t1, toHonored: (t1 || '').toLowerCase().indexOf('fu-probe-a') >= 0 });
+    try { d1.deleteDraft(); } catch (_) {}
+  } catch (e) { out.tests.push({ method: 'createDraftReply+to', error: (e && e.message) || String(e) }); }
+  try {
+    var d2 = thread.createDraftReplyAll('probe', { htmlBody: 'probe' });
+    var t2 = ''; try { t2 = d2.getMessage().getTo(); } catch (_) {}
+    out.tests.push({ method: 'createDraftReplyAll', actualTo: t2 });
+    try { d2.deleteDraft(); } catch (_) {}
+  } catch (e) { out.tests.push({ method: 'createDraftReplyAll', error: (e && e.message) || String(e) }); }
+  return out;
+}
+
+// PATCH 2026-06-19-fu-recipient: end-to-end verify the FIXED follow-up path. Creates a
+// threaded draft to a PROBE recipient (not a real lead) via _fuCreateThreadedDraftToLead_
+// → confirms (a) the Gmail Advanced Service is enabled, (b) the draft is addressed to the
+// recipient we asked for (not self), (c) GmailApp can resolve the returned draftId (so the
+// syncer won't false-delete it), then deletes the probe draft. argS = threadId.
+function menuTestGmailApiDraft(a, argS) {
+  var threadId = String(argS || '').trim();
+  if (!threadId) return { status: 'error', error: 'argS=threadId required' };
+  var thread;
+  try { thread = GmailApp.getThreadById(threadId); } catch (e) { return { status: 'error', error: e.message }; }
+  if (!thread) return { status: 'error', error: 'thread not found: ' + threadId };
+
+  var out = {
+    status: 'ok',
+    threadId: threadId,
+    advancedServiceAvailable: (typeof Gmail !== 'undefined' && !!Gmail && !!Gmail.Users && !!Gmail.Users.Drafts)
+  };
+  if (!out.advancedServiceAvailable) {
+    out.actionRequired = 'Enable the Gmail Advanced Service: Apps Script editor → Services (+ icon) → ' +
+                         'Gmail API → Add. No re-authorization needed (gmail.modify/compose already granted).';
+    return out;
+  }
+
+  var subj = ''; try { subj = thread.getFirstMessageSubject() || ''; } catch (_) {}
+  try {
+    var res = _fuCreateThreadedDraftToLead_(
+      thread.getId(), 'fu-recipient-probe@example.com', subj, '<p>probe body</p>', 'probe body', '', 'Gaurav Rathore');
+    out.created = res;
+    if (res && res.ok && res.draftId) {
+      var resolves = false, actualTo = '';
+      try {
+        var d = GmailApp.getDraft(res.draftId);
+        resolves = true;
+        try { actualTo = d.getMessage().getTo(); } catch (_) {}
+      } catch (ge) { out.getDraftErr = ge.message; }
+      out.gmailAppResolvesDraftId = resolves;   // must be true → syncer-safe
+      out.actualTo = actualTo;
+      out.addressesRequestedRecipient = (actualTo || '').toLowerCase().indexOf('fu-recipient-probe@example.com') >= 0;
+      // Cleanup: prefer the Advanced Service remove, fall back to GmailApp.
+      try { Gmail.Users.Drafts.remove('me', res.draftId); out.cleanedUp = true; }
+      catch (ce) {
+        try { GmailApp.getDraft(res.draftId).deleteDraft(); out.cleanedUp = true; }
+        catch (ce2) { out.cleanedUp = false; out.cleanupErr = ce2.message; }
+      }
+    }
+  } catch (e) { out.status = 'error'; out.error = (e && e.message) || String(e); }
+  return out;
+}
+
+// PATCH 2026-06-19-fu-thread: show a lead's email thread — the sent cold email +
+// any pending follow-up reply DRAFTS that live inside that thread — as concrete
+// proof the follow-up engine creates threaded replies. argS = lead name/email; if
+// blank, auto-picks the first FOLLOWUP_* lead with a threadId. Read-only.
+function menuShowFollowUpThread(a, argS) {
+  var term = String(argS || '').toLowerCase().trim();
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var sh = ss.getSheetByName(CONFIG.DATA_SHEET);
+  if (!sh) return { status: 'error', error: 'data sheet missing' };
+  var c = CONFIG.COLUMNS;
+  if (!c.THREAD_ID) return { status: 'error', error: 'no THREAD_ID column configured' };
+  var last = sh.getLastRow();
+  if (last < 2) return { status: 'ok', note: 'no rows' };
+  var width = CONFIG.SHEET_COL_COUNT || 28;
+  var data = sh.getRange(2, 1, last - 1, width).getValues();
+  var found = null;
+  for (var i = 0; i < data.length; i++) {
+    var r = data[i];
+    var tid = String(r[c.THREAD_ID - 1] || '').trim();
+    if (!tid) continue;
+    var st = String(r[c.STATUS - 1] || '');
+    var nm = String(r[c.FULL_NAME - 1] || '').toLowerCase();
+    var em = String(r[c.ENRICHED_EMAIL - 1] || r[c.EMAIL - 1] || '').toLowerCase();
+    var isMatch = term ? (nm.indexOf(term) >= 0 || em.indexOf(term) >= 0) : (st.indexOf('FOLLOWUP_') === 0);
+    if (isMatch) { found = { rowNum: i + 2, name: String(r[c.FULL_NAME - 1] || ''), status: st, threadId: tid }; break; }
+  }
+  if (!found) return { status: 'error', error: term ? 'no lead matching "' + term + '" with a threadId' : 'no FOLLOWUP_* lead with a threadId' };
+  var out = { lead: found, messages: [], pendingFollowUpDrafts: [] };
+  try {
+    var thread = GmailApp.getThreadById(found.threadId);
+    if (!thread) { out.threadErr = 'thread not found'; return out; }
+    out.messageCount = thread.getMessageCount();
+    thread.getMessages().forEach(function(m) {
+      out.messages.push({
+        date: m.getDate().toISOString(),
+        from: (m.getFrom() || '').toString().substring(0, 45),
+        to: (m.getTo() || '').toString().substring(0, 45),
+        subject: (m.getSubject() || '').toString().substring(0, 80)
+      });
+    });
+  } catch (e) { out.threadErr = (e && e.message) || String(e); return out; }
+  try {
+    var drafts = GmailApp.getDrafts(), checked = 0, matches = 0;
+    for (var k = 0; k < drafts.length && checked < 250 && matches < 3; k++) {
+      checked++;
+      try {
+        var dm = drafts[k].getMessage();
+        if (dm.getThread().getId() === found.threadId) {
+          matches++;
+          out.pendingFollowUpDrafts.push({
+            draftId: drafts[k].getId(),
+            to: (dm.getTo() || '').toString().substring(0, 45),
+            subject: (dm.getSubject() || '').toString().substring(0, 80),
+            snippet: (dm.getPlainBody() || '').toString().replace(/\s+/g, ' ').substring(0, 120)
+          });
+        }
+      } catch (_) {}
+    }
+    out.draftsScanned = checked;
+  } catch (e) { out.draftScanErr = (e && e.message) || String(e); }
+  return out;
+}
+
+// PATCH 2026-06-19-whoami: which Gmail account does the pipeline run as / hold the
+// drafts in? Resolves "I can't see my drafts" — they live in the EFFECTIVE user's
+// Drafts, which may differ from whichever Google account the user is viewing.
+function menuWhoAmI() {
+  var out = { ts: new Date().toISOString() };
+  try { out.activeUser = Session.getActiveUser().getEmail(); } catch (e) { out.activeUserErr = (e && e.message) || String(e); }
+  try { out.effectiveUser = Session.getEffectiveUser().getEmail(); } catch (e) { out.effectiveUserErr = (e && e.message) || String(e); }
+  try {
+    var drafts = GmailApp.getDrafts();
+    out.draftCount = drafts.length;
+    if (drafts.length) { try { out.newestDraftTo = drafts[0].getMessage().getTo(); } catch (_) {} }
+  } catch (e) { out.draftErr = (e && e.message) || String(e); }
+  return out;
+}
+
+// PATCH 2026-06-18-draftsync-transient: RECOVERY — restore leads falsely marked
+// DRAFT_DELETED whose Gmail draft actually still exists (proven by getDraft).
+// Scans DRAFT_DELETED rows, probes each draftId; if the draft resolves → flip back
+// to DRAFT_CREATED. Genuinely-gone drafts and transient-lookup rows are left alone
+// (safe: only PROVEN-existing drafts are restored). Run AFTER the syncer transient
+// fix is deployed, else they'd be re-deleted. arg1 = max getDraft probes this run
+// (default 300, to stay within the Gmail op budget — re-run to drain the rest).
+function menuRestoreFalseDeletedDrafts(a) {
+  var cap = (typeof a === 'number' && a > 0) ? a : 300;
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var sh = ss.getSheetByName(CONFIG.DATA_SHEET);
+  if (!sh) return { status: 'error', error: 'data sheet missing' };
+  var c = CONFIG.COLUMNS;
+  var last = sh.getLastRow();
+  if (last < 2) return { status: 'ok', scanned: 0, restored: 0 };
+  var width = CONFIG.SHEET_COL_COUNT || 28;
+  var data = sh.getRange(2, 1, last - 1, width).getValues();
+  var scanned = 0, restored = 0, stillGone = 0, transient = 0, noId = 0;
+  var sampleRestored = [];
+  for (var i = 0; i < data.length && scanned < cap; i++) {
+    var r = data[i];
+    if (String(r[c.STATUS - 1] || '') !== 'DRAFT_DELETED') continue;
+    var draftId = String(r[c.DRAFT_ID - 1] || '').trim();
+    if (!draftId) { noId++; continue; }
+    scanned++;
+    var exists = false, gone = false;
+    try { exists = !!GmailApp.getDraft(draftId); }
+    catch (e) {
+      if (typeof _draftLookupErrorMeansGone === 'function' && _draftLookupErrorMeansGone(e && e.message)) gone = true;
+      else { transient++; continue; }  // transient → leave as-is, don't touch
+    }
+    if (exists) {
+      var rowNum = i + 2;
+      sh.getRange(rowNum, c.STATUS).setValue('DRAFT_CREATED');
+      var notes = String(r[c.NOTES - 1] || '');
+      sh.getRange(rowNum, c.NOTES).setValue(
+        ('[RESTORED_FALSE_DELETE] draft ' + draftId + ' still exists in Gmail — was wrongly marked DRAFT_DELETED by a transient syncer lookup. ' + notes).substring(0, 1900));
+      if (c.LAST_UPDATED) sh.getRange(rowNum, c.LAST_UPDATED).setValue(new Date().toISOString());
+      restored++;
+      if (sampleRestored.length < 20) sampleRestored.push({ row: rowNum, to: String(r[c.ENRICHED_EMAIL - 1] || r[c.EMAIL - 1] || '') });
+    } else if (gone) { stillGone++; }
+  }
+  return {
+    status: 'ok', scannedDraftDeleted: scanned, restored: restored,
+    genuinelyGone: stillGone, transientSkipped: transient, noDraftId: noId,
+    sampleRestored: sampleRestored,
+    note: restored + ' lead(s) had a live draft and were restored to DRAFT_CREATED. ' +
+          (transient ? transient + ' skipped on transient lookup — re-run to drain. ' : '') +
+          'Genuinely-deleted leads left as DRAFT_DELETED.'
+  };
+}
+
+// PATCH 2026-06-17-verify-email-hold: promote a lead held at VERIFY_EMAIL (a
+// low-confidence guessed address) once the user has confirmed the address is
+// correct. Flips STATUS → NEW and stamps [EMAIL_VERIFIED_BY_USER] so the hold
+// gate (_processOneLead) is bypassed on the re-run and the lead drafts to the
+// stored ENRICHED_EMAIL. arg1 = rowNum (>=2). Lock-guarded (sheet writes).
+function menuPromoteEmailVerify(a, _) {
+  var rowNum = (typeof a === 'number') ? a : parseInt(a, 10);
+  if (!rowNum || rowNum < 2) return { status: 'error', error: 'arg1 rowNum (>=2) required' };
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var sh = ss.getSheetByName(CONFIG.DATA_SHEET);
+  if (!sh) return { status: 'error', error: 'data sheet not found' };
+  if (rowNum > sh.getLastRow()) return { status: 'error', error: 'rowNum past last row' };
+  var C = CONFIG.COLUMNS;
+  var cur = String(sh.getRange(rowNum, C.STATUS).getValue() || '');
+  if (cur !== 'VERIFY_EMAIL') {
+    return { status: 'error', error: 'row ' + rowNum + ' is "' + cur + '", not VERIFY_EMAIL', currentStatus: cur };
+  }
+  var email = C.ENRICHED_EMAIL ? String(sh.getRange(rowNum, C.ENRICHED_EMAIL).getValue() || '') : '';
+  var notes = C.NOTES ? String(sh.getRange(rowNum, C.NOTES).getValue() || '') : '';
+  sh.getRange(rowNum, C.STATUS).setValue('NEW');
+  if (C.NOTES) sh.getRange(rowNum, C.NOTES).setValue((notes + ' [EMAIL_VERIFIED_BY_USER]').trim().substring(0, 1900));
+  if (C.LAST_UPDATED) sh.getRange(rowNum, C.LAST_UPDATED).setValue(new Date().toISOString());
+  return {
+    status: 'ok', row: rowNum,
+    name: String(sh.getRange(rowNum, C.FULL_NAME).getValue() || ''),
+    promotedEmail: email, statusAfter: 'NEW',
+    note: 'Promoted VERIFY_EMAIL → NEW with [EMAIL_VERIFIED_BY_USER]. The scanner will re-run the full pipeline and draft to this address (the hold gate is now bypassed). If the address is WRONG, correct ENRICHED_EMAIL before promoting.'
+  };
+}
+
+// PATCH 2026-06-19-email-lock: correct a held lead's address to a HUMAN-VERIFIED one and
+// promote it — SAFELY. menuPromoteEmailVerify alone is unsafe when the derived address is
+// WRONG: the scanner re-runs the finalizer, which deterministically RE-derives the same
+// wrong address (e.g. bistro.sk) and drafts to it (hold gate bypassed). This writes
+// [EMAIL_LOCKED:<addr>] into NOTES, which finalizeEmailSelection honours as highest
+// precedence (skips all derivation), so the corrected address actually sticks.
+// a = rowNum (>=2), argS = the correct email. Whitelisted under a LockService guard.
+function menuCorrectAndPromoteEmail(a, argS) {
+  var rowNum = (typeof a === 'number') ? a : parseInt(a, 10);
+  var email = String(argS || '').toLowerCase().trim();
+  if (!rowNum || rowNum < 2) return { status: 'error', error: 'arg1 rowNum (>=2) required' };
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { status: 'error', error: 'argS must be a valid email — got: "' + email + '"' };
+  }
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var sh = ss.getSheetByName(CONFIG.DATA_SHEET);
+  if (!sh) return { status: 'error', error: 'data sheet not found' };
+  if (rowNum > sh.getLastRow()) return { status: 'error', error: 'rowNum past last row' };
+  var C = CONFIG.COLUMNS;
+  var statusBefore = String(sh.getRange(rowNum, C.STATUS).getValue() || '');
+  var name = String(sh.getRange(rowNum, C.FULL_NAME).getValue() || '');
+  var prevEmail = C.ENRICHED_EMAIL ? String(sh.getRange(rowNum, C.ENRICHED_EMAIL).getValue() || '') : '';
+  var notes = C.NOTES ? String(sh.getRange(rowNum, C.NOTES).getValue() || '') : '';
+  // Strip any prior lock marker so markers don't stack across corrections.
+  notes = notes.replace(/\[EMAIL_LOCKED:[^\]]*\]/gi, '').replace(/\s{2,}/g, ' ').trim();
+  if (C.ENRICHED_EMAIL) sh.getRange(rowNum, C.ENRICHED_EMAIL).setValue(email);
+  // DURABLE lock (survives notes rewrites + reprocessing — the Vedansh fix). The NOTES
+  // marker below is kept as a secondary/visible signal, but this is the authoritative store.
+  if (typeof _emailLockSet_ === 'function') _emailLockSet_(rowNum, email);
+  if (C.NOTES) {
+    sh.getRange(rowNum, C.NOTES).setValue(
+      (notes + ' [EMAIL_LOCKED:' + email + '] [EMAIL_VERIFIED_BY_USER]').trim().substring(0, 1900));
+  }
+  sh.getRange(rowNum, C.STATUS).setValue('NEW');
+  if (C.LAST_UPDATED) sh.getRange(rowNum, C.LAST_UPDATED).setValue(new Date().toISOString());
+  return {
+    status: 'ok', row: rowNum, name: name,
+    previousEmail: prevEmail, lockedEmail: email,
+    statusBefore: statusBefore, statusAfter: 'NEW',
+    note: 'Locked ' + email + ' ([EMAIL_LOCKED]) and promoted to NEW. The finalizer will trust ' +
+          'this address verbatim (no re-derivation) and draft to it on the next scan.'
+  };
+}
+
+// PATCH 2026-06-19-trust-org: toggle the headline→org override (_reconcileCurrentEmployer).
+// arg1=0 → DISABLE (the APK org field becomes authoritative; the noisy headline never overrides it
+// — the user's "trust the org field" choice, which also stops tagline/past-role mis-extractions
+// from corrupting org). arg1=1 → re-enable. Read back by _employerReconcileEnabled_ (default ON).
+function menuSetEmployerReconcileEnabled(a) {
+  var on = !(String(a) === '0' || a === 0);
+  PropertiesService.getScriptProperties().setProperty('EMPLOYER_RECONCILE_ENABLED', on ? '1' : '0');
+  return {
+    status: 'ok', EMPLOYER_RECONCILE_ENABLED: on ? '1' : '0',
+    effect: on ? 'headline may override a conflicting org field'
+               : 'org field is AUTHORITATIVE — headline ignored for current-employer (trust-org mode)'
+  };
+}
+
+// PATCH 2026-06-19-trust-org: clear a suspect durable email lock AND park the lead at VERIFY_EMAIL
+// for human review (used when a prior lock was probably wrong — e.g. org and headline disagree on
+// the employer). a = rowNum, argS = review note shown to the user. Lock-guarded via the whitelist.
+function menuUnlockEmailAndHold(a, argS) {
+  var rowNum = (typeof a === 'number') ? a : parseInt(a, 10);
+  if (!rowNum || rowNum < 2) return { status: 'error', error: 'arg1 rowNum (>=2) required' };
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var sh = ss.getSheetByName(CONFIG.DATA_SHEET);
+  if (!sh) return { status: 'error', error: 'data sheet not found' };
+  if (rowNum > sh.getLastRow()) return { status: 'error', error: 'rowNum past last row' };
+  var C = CONFIG.COLUMNS;
+  var name = String(sh.getRange(rowNum, C.FULL_NAME).getValue() || '');
+  var before = String(sh.getRange(rowNum, C.STATUS).getValue() || '');
+  var clearedLock = (typeof _emailLockClear_ === 'function') ? _emailLockClear_(rowNum) : false;
+  var notes = C.NOTES ? String(sh.getRange(rowNum, C.NOTES).getValue() || '') : '';
+  notes = notes.replace(/\[EMAIL_LOCKED:[^\]]*\]/gi, '').replace(/\[EMAIL_VERIFIED_BY_USER\]/gi, '')
+               .replace(/\s{2,}/g, ' ').trim();
+  var review = String(argS || 'employer ambiguous — confirm current company before drafting');
+  if (C.NOTES) sh.getRange(rowNum, C.NOTES).setValue((notes + ' [EMAIL_REVIEW] ' + review).trim().substring(0, 1900));
+  sh.getRange(rowNum, C.STATUS).setValue('VERIFY_EMAIL');
+  if (C.LAST_UPDATED) sh.getRange(rowNum, C.LAST_UPDATED).setValue(new Date().toISOString());
+  return {
+    status: 'ok', row: rowNum, name: name, statusBefore: before, statusAfter: 'VERIFY_EMAIL',
+    clearedDurableLock: clearedLock, reviewNote: review
+  };
+}
+
+// PATCH 2026-06-19-org-override: set a HUMAN-VERIFIED current employer, then promote — fixing BOTH
+// the letter (composer reads lead.organization → org override) and the recipient. TWO modes:
+//   argS = "Org Name"               → ENGINE mode (PREFERRED): set org override, CLEAR any prior
+//                                     lock + stale enriched email, promote → the 3-tier enrichment
+//                                     engine (Apollo→Snov→pattern, Reoon/MX-validated) re-derives
+//                                     the BEST VALIDATED email against the verified company. We
+//                                     supply the company (human-verified); the engine does the email.
+//   argS = "Org Name|email@domain"  → LOCK mode: also durably lock a KNOWN-correct email (human
+//                                     truth — skips engine derivation). Only when you KNOW the address.
+// Use after confirming where someone actually works. a = rowNum. Lock-guarded via whitelist.
+function menuFixEmployerAndPromote(a, argS) {
+  var rowNum = (typeof a === 'number') ? a : parseInt(a, 10);
+  if (!rowNum || rowNum < 2) return { status: 'error', error: 'arg1 rowNum (>=2) required' };
+  var parts = String(argS || '').split('|');
+  var org = (parts[0] || '').trim();
+  var email = (parts[1] || '').trim().toLowerCase();
+  if (!org) return { status: 'error', error: 'argS must be "Org Name" or "Org Name|email@domain" — missing org' };
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { status: 'error', error: 'optional email is malformed: "' + email + '"' };
+  }
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var sh = ss.getSheetByName(CONFIG.DATA_SHEET);
+  if (!sh) return { status: 'error', error: 'data sheet not found' };
+  if (rowNum > sh.getLastRow()) return { status: 'error', error: 'rowNum past last row' };
+  var C = CONFIG.COLUMNS;
+  var name = String(sh.getRange(rowNum, C.FULL_NAME).getValue() || '');
+  var before = String(sh.getRange(rowNum, C.STATUS).getValue() || '');
+  var orgSet = (typeof _orgOverrideSet_ === 'function') ? _orgOverrideSet_(rowNum, org) : false;
+  var notes = C.NOTES ? String(sh.getRange(rowNum, C.NOTES).getValue() || '') : '';
+  notes = notes.replace(/\[EMAIL_LOCKED:[^\]]*\]/gi, '').replace(/\[EMAIL_REVIEW\][^\[]*/gi, '')
+               .replace(/\[ORG_VERIFIED:[^\]]*\]/gi, '').replace(/\[EMAIL_REENRICH\]/gi, '')
+               .replace(/\[EMAIL_VERIFIED_BY_USER\]/gi, '').replace(/\s{2,}/g, ' ').trim();
+  var mode, lockSet = false, markers;
+  if (email) {
+    lockSet = (typeof _emailLockSet_ === 'function') ? _emailLockSet_(rowNum, email) : false;
+    if (C.ENRICHED_EMAIL) sh.getRange(rowNum, C.ENRICHED_EMAIL).setValue(email);
+    mode = 'locked_known_email';
+    markers = ' [ORG_VERIFIED:' + org + '] [EMAIL_LOCKED:' + email + '] [EMAIL_VERIFIED_BY_USER]';
+  } else {
+    if (typeof _emailLockClear_ === 'function') _emailLockClear_(rowNum);        // drop any prior guess
+    if (C.ENRICHED_EMAIL) sh.getRange(rowNum, C.ENRICHED_EMAIL).setValue('');     // force fresh engine derivation
+    mode = 'engine_rederive';
+    markers = ' [ORG_VERIFIED:' + org + '] [EMAIL_REENRICH]';
+  }
+  if (C.NOTES) sh.getRange(rowNum, C.NOTES).setValue((notes + markers).trim().substring(0, 1900));
+  sh.getRange(rowNum, C.STATUS).setValue('NEW');
+  if (C.LAST_UPDATED) sh.getRange(rowNum, C.LAST_UPDATED).setValue(new Date().toISOString());
+  return {
+    status: 'ok', row: rowNum, name: name, statusBefore: before, statusAfter: 'NEW',
+    mode: mode, verifiedOrg: org, lockedEmail: email || null, orgOverrideSet: orgSet, emailLockSet: lockSet,
+    note: (email
+      ? 'LOCK mode: locked known email ' + email + ' + org "' + org + '"; promoted.'
+      : 'ENGINE mode: org "' + org + '" verified; prior lock + stale email cleared. The 3-tier enrichment ' +
+        'engine will derive + Reoon-validate the best email against ' + org + ' on the next scan ' +
+        '(or hold at VERIFY_EMAIL if it can only produce a low-confidence guess).')
+  };
+}
+
+// ── FOLLOW-UP DIAGNOSTIC + CROSS-EMAIL DEDUP CLEANUP (-p7-followup-identity) ──
+// menuFollowupsForLead(_, argS): dump FollowUps rows whose Email / LeadName / ParentRow
+// contains argS (case-insensitive). Read-only. Flags fallback (frozen) bodies.
+function menuFollowupsForLead(_, argS) {
+  var needle = String(argS || '').trim().toLowerCase();
+  if (!needle) return { status: 'error', error: 'argS required: email / name / parentRow substring' };
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var sh = ss.getSheetByName('FollowUps');
+  if (!sh) return { status: 'error', error: 'FollowUps sheet not found' };
+  var data = sh.getDataRange().getValues();
+  if (data.length < 2) return { status: 'ok', matches: [] };
+  var H = data[0].map(function(h){ return (h||'').toString().trim(); });
+  var ix = {}; H.forEach(function(h,i){ ix[h]=i; });
+  var out = [];
+  for (var r = 1; r < data.length; r++) {
+    var row = data[r];
+    var email = (row[ix['Email']]||'').toString();
+    var name  = (ix['LeadName']!==undefined ? row[ix['LeadName']] : '') + '';
+    var pr    = (ix['ParentRow']!==undefined ? row[ix['ParentRow']] : '') + '';
+    if ((email + ' ' + name + ' ' + pr).toLowerCase().indexOf(needle) < 0) continue;
+    var bodyVal = (ix['Body']!==undefined ? row[ix['Body']] : '') || '';
+    out.push({
+      sheetRow: r + 1, email: email, leadName: name,
+      stage: (row[ix['Stage']]||'') + '', status: (row[ix['Status']]||'') + '', parentRow: pr,
+      scheduledDate: (row[ix['ScheduledDate']]||'') + '',
+      bodyIsFallback: (typeof _fuBodyLooksLikeFallback_ === 'function') && _fuBodyLooksLikeFallback_(bodyVal),
+      bodyPreview: bodyVal.toString().replace(/\s+/g,' ').substring(0, 90)
+    });
+  }
+  return { status: 'ok', needle: needle, count: out.length, matches: out.slice(0, 60) };
+}
+
+// menuCleanupCrossEmailFollowups(arg1, argS): cancel cross-email DUPLICATE PENDING
+// follow-up sets for the SAME lead — the Samriddhi (Wishlink→Lendbox) class. Groups
+// PENDING rows by (ParentRow, Stage); when a group has >1 row under >1 distinct email,
+// keeps the EARLIEST-scheduled and marks the rest CANCELLED. arg1 = a ParentRow to
+// limit to (0/blank = all). argS='execute' writes; anything else = DRY RUN.
+function menuCleanupCrossEmailFollowups(arg1, argS) {
+  var onlyParent = parseInt(arg1, 10) || 0;
+  var doExecute = String(argS || '').trim().toLowerCase() === 'execute';
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var sh = ss.getSheetByName('FollowUps');
+  if (!sh) return { status: 'error', error: 'FollowUps sheet not found' };
+  var data = sh.getDataRange().getValues();
+  if (data.length < 2) return { status: 'ok', crossEmailDupGroups: 0, cancelled: 0 };
+  var H = data[0].map(function(h){ return (h||'').toString().trim(); });
+  var ix = {}; H.forEach(function(h,i){ ix[h]=i; });
+  if (ix['ParentRow'] === undefined || ix['Stage'] === undefined || ix['Status'] === undefined) {
+    return { status: 'error', error: 'FollowUps missing ParentRow/Stage/Status columns' };
+  }
+  var groups = {};
+  for (var r = 1; r < data.length; r++) {
+    var row = data[r];
+    if (((row[ix['Status']]||'')+'').trim() !== 'PENDING') continue;
+    var pr = parseInt(row[ix['ParentRow']], 10) || 0;
+    if (!pr || (onlyParent && pr !== onlyParent)) continue;
+    var stage = ((row[ix['Stage']]||'')+'').trim();
+    var email = ((row[ix['Email']]||'')+'').trim().toLowerCase();
+    var schedMs = (ix['ScheduledDate']!==undefined && row[ix['ScheduledDate']]) ? (new Date(row[ix['ScheduledDate']]).getTime() || 0) : 0;
+    var k = pr + '|' + stage;
+    (groups[k] = groups[k] || []).push({ sheetRow: r + 1, email: email, schedMs: schedMs });
+  }
+  var dupGroups = 0, cancelled = 0, report = [];
+  Object.keys(groups).forEach(function(k){
+    var g = groups[k], emails = {};
+    g.forEach(function(x){ emails[x.email] = true; });
+    if (g.length < 2 || Object.keys(emails).length < 2) return;  // true cross-email collision only
+    dupGroups++;
+    g.sort(function(a,b){ return (a.schedMs - b.schedMs) || (a.sheetRow - b.sheetRow); });
+    var keep = g[0];
+    for (var j = 1; j < g.length; j++) {
+      report.push({ parentStage: k, cancelSheetRow: g[j].sheetRow, cancelEmail: g[j].email, keptEmail: keep.email });
+      if (doExecute) {
+        sh.getRange(g[j].sheetRow, ix['Status'] + 1).setValue('CANCELLED');
+        if (ix['Notes'] !== undefined) sh.getRange(g[j].sheetRow, ix['Notes'] + 1).setValue('[DUP_FOLLOWUP_XEMAIL] superseded — kept ' + keep.email);
+        cancelled++;
+      }
+    }
+  });
+  return { status: 'ok', mode: doExecute ? 'execute' : 'dryrun', onlyParent: onlyParent || 'all',
+           crossEmailDupGroups: dupGroups, cancelled: cancelled, sample: report.slice(0, 40) };
+}
+
+// PATCH 2026-06-20-sheet2-spill: diagnose/repair a STALLED =UNIQUE(Sheet1!B2:G) spill — new Sheet1
+// captures land but Sheet2 stops growing (Parth Shah landed yet never reached the pipeline). The
+// classic cause is a stray value pasted into the A:F spill range BELOW the live spill, which dams
+// further expansion. arg1=0 → DRY (inspect only); arg1=1 → REPAIR. Repair only ever (a) reinstalls
+// the formula IF A2 is empty and (b) clears stray A:F cells BELOW the spill — it never reorders the
+// existing spill, so the G-U pipeline state stays aligned to the same leads.
+function menuRepairSheet2Spill(a) {
+  var doRepair = (String(a) === '1' || a === 1);
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var s1 = ss.getSheetByName('Sheet1');
+  var s2 = ss.getSheetByName(CONFIG.DATA_SHEET);
+  if (!s1 || !s2) return { status: 'error', error: 'sheet missing', sheet1: !!s1, sheet2: !!s2 };
+  var out = { status: 'ok', mode: doRepair ? 'repair' : 'dryrun' };
+  out.sheet1LastRow = s1.getLastRow();
+  out.sheet2LastRow = s2.getLastRow();
+  out.a2formula = s2.getRange('A2').getFormula();
+  out.a2isUnique = /UNIQUE/i.test(out.a2formula) && /Sheet1/i.test(out.a2formula);
+  out.a2value = String(s2.getRange('A2').getValue()).substring(0, 60);
+  var last = s2.getLastRow();
+  var af = s2.getRange(2, 1, Math.max(1, last - 1), 6).getValues();
+  var firstEmpty = -1, strays = [];
+  for (var i = 0; i < af.length; i++) {
+    var empty = af[i].every(function (c) { return String(c).trim() === ''; });
+    if (empty && firstEmpty < 0) firstEmpty = i + 2;
+    if (!empty && firstEmpty >= 0) strays.push(i + 2);
+  }
+  out.spillEndsAtRow = (firstEmpty > 0 ? firstEmpty - 1 : last);
+  out.firstEmptyRow = firstEmpty;
+  out.strayRowsBelowSpill = strays.slice(0, 25);
+  out.strayCount = strays.length;
+  out.straySamples = [];
+  strays.slice(0, 6).forEach(function (r) {
+    out.straySamples.push({ row: r, vals: s2.getRange(r, 1, 1, 6).getValues()[0].map(function (c) { return String(c).substring(0, 24); }) });
+  });
+  if (doRepair) {
+    var actions = [];
+    // 0) Snapshot the current spill's identity (col A = LinkedIn URL) so we can PROVE the G-U
+    //    pipeline state still maps to the same leads after the recalc.
+    var snapN = Math.max(0, out.sheet2LastRow - 1);
+    var beforeA = snapN > 0 ? s2.getRange(2, 1, snapN, 1).getValues().map(function (r) { return String(r[0]); }) : [];
+    // 1) Clear any stray blockers (none expected here, but safe).
+    var cleared = 0;
+    strays.forEach(function (r) { s2.getRange(r, 1, 1, 6).clearContent(); cleared++; });
+    if (cleared) actions.push('cleared_' + cleared + '_stray_rows');
+    // 2) If the formula is missing AND A2 is empty, install it; otherwise FORCE a recalc of the
+    //    stuck spill (clear the anchor + re-set). Safe: Sheet1 is append-only → UNIQUE re-emits the
+    //    same rows in the same order and appends the new ones at the bottom.
+    if (!out.a2isUnique && out.a2value !== '' && out.a2value !== 'null') {
+      out.actions = ['A2_NOT_FORMULA_AND_NOT_EMPTY — left untouched, needs manual review'];
+      return out;
+    }
+    s2.getRange('A2').clearContent(); SpreadsheetApp.flush();
+    s2.getRange('A2').setFormula('=UNIQUE(Sheet1!B2:G)'); SpreadsheetApp.flush();
+    actions.push('forced_spill_recalc');
+    out.sheet2LastRowAfter = s2.getLastRow();
+    out.newRowsAdded = out.sheet2LastRowAfter - out.sheet2LastRow;
+    // 3) Verify alignment — the first snapN rows must be byte-identical (col A) to before.
+    var afterA = snapN > 0 ? s2.getRange(2, 1, snapN, 1).getValues().map(function (r) { return String(r[0]); }) : [];
+    var mism = 0, firstMismRow = -1;
+    for (var k = 0; k < snapN; k++) { if (beforeA[k] !== afterA[k]) { mism++; if (firstMismRow < 0) firstMismRow = k + 2; } }
+    out.alignmentRowsChecked = snapN;
+    out.alignmentMismatches = mism;
+    out.alignmentSafe = (mism === 0);
+    out.firstMismatchRow = firstMismRow;
+    out.actions = actions;
+  }
+  return out;
+}
+
+// PATCH 2026-06-20-fu-scrub: clean PRE-FIX self-addressed follow-up drafts. Each created follow-up
+// row in the 'FollowUps' sheet is marked Status='SENT' with 'draftId=<id>' in Notes. We read each
+// such draft's recipient; if it's addressed to the OWNER (self — the pre-@241 bug), we delete the
+// broken draft and reset the row to PENDING so the daily trigger regenerates it LEAD-addressed (and
+// now styled). arg1=0 → DRY (count + samples); arg1=1 → execute. Lock-guarded via whitelist.
+function menuScrubSelfAddressedFollowups(a) {
+  var doFix = (String(a) === '1' || a === 1);
+  var owner = '';
+  try { owner = (Session.getEffectiveUser().getEmail() || '').toLowerCase(); } catch (_) {}
+  if (!owner) return { status: 'error', error: 'could not resolve owner email' };
+
+  // The FollowUps sheet has NO Notes column on this deployment, so the draftId is never persisted
+  // (live code writes it only `if col.notes >= 0`). We can't key off the sheet — scan Gmail directly.
+  // A pre-fix self-addressed follow-up is a draft whose subject is a "Re:" reply, inside one of OUR
+  // self-started cold-email threads (first msg FROM the owner), addressed TO the owner instead of the
+  // lead. Delete it + reset that lead's (email,stage) FollowUps row to PENDING so the daily trigger
+  // regenerates it lead-addressed + newly styled. stage = thread message count (original + sent
+  // follow-ups; the pending draft is the next stage, not yet a thread message).
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var fu = ss.getSheetByName('FollowUps');
+  var fuData = (fu ? fu.getDataRange().getValues() : []);
+  var fuHeaders = (fuData.length ? fuData[0].map(function (h) { return (h || '').toString().trim(); }) : []);
+  function fcol(name) {
+    var n = name.toLowerCase();
+    for (var k = 0; k < fuHeaders.length; k++) { if (fuHeaders[k].toLowerCase().indexOf(n) >= 0) return k; }
+    return -1;
+  }
+  var cEmail = fcol('email'), cStatus = fcol('status'), cStage = fcol('stage');
+
+  var drafts = GmailApp.getDrafts();
+  var out = { status: 'ok', mode: doFix ? 'execute' : 'dryrun', owner: owner,
+              draftsScanned: drafts.length, followupReplies: 0, selfAddressed: 0,
+              deleted: 0, rowsReset: 0, samples: [] };
+
+  for (var i = 0; i < drafts.length; i++) {
+    var msg;
+    try { msg = drafts[i].getMessage(); } catch (e) { continue; }
+    var subj = (msg.getSubject() || '').trim();
+    if (!/^re:/i.test(subj)) continue;                          // follow-ups are "Re:" threaded replies
+    out.followupReplies++;
+    var to = (msg.getTo() || '').toLowerCase();
+    if (to.indexOf(owner) < 0) continue;                        // addressed to the lead = correct → skip
+
+    var leadEmail = '', stage = 0, firstFrom = '';
+    try {
+      var th = msg.getThread();
+      var msgs = th.getMessages();
+      firstFrom = (msgs[0].getFrom() || '').toLowerCase();
+      var rawTo = (msgs[0].getTo() || '').toString();
+      var mm = rawTo.match(/<([^>]+)>/);
+      leadEmail = (mm ? mm[1] : rawTo).trim().toLowerCase();
+      stage = th.getMessageCount();
+    } catch (_) {}
+    if (firstFrom.indexOf(owner) < 0) continue;                 // not our self-started cold-email thread → skip
+
+    out.selfAddressed++;
+    if (out.samples.length < 12) {
+      out.samples.push({ draftId: drafts[i].getId(), subject: subj.substring(0, 45),
+                         to: to.substring(0, 35), leadEmail: leadEmail, stage: stage });
+    }
+    if (doFix) {
+      try { drafts[i].deleteDraft(); out.deleted++; } catch (_) {}
+      if (fu && cEmail >= 0 && cStatus >= 0 && cStage >= 0 && leadEmail && stage) {
+        for (var r = 1; r < fuData.length; r++) {
+          if ((fuData[r][cEmail] || '').toString().toLowerCase() === leadEmail &&
+              parseInt(fuData[r][cStage], 10) === stage &&
+              (fuData[r][cStatus] || '').toString().trim() === 'SENT') {
+            fu.getRange(r + 1, cStatus + 1).setValue('PENDING');
+            fuData[r][cStatus] = 'PENDING';   // in-memory guard against double-reset
+            out.rowsReset++;
+          }
+        }
+      }
+    }
+  }
+  out.note = doFix
+    ? 'Deleted ' + out.deleted + ' self-addressed follow-up drafts + reset ' + out.rowsReset +
+      ' FollowUps row(s) to PENDING → the daily trigger (processScheduledFollowUps) regenerates them ' +
+      'LEAD-addressed with the new styling.'
+    : out.selfAddressed + ' self-addressed follow-up draft(s) found (of ' + out.followupReplies +
+      ' "Re:" drafts scanned). Set arg1=1 to delete + reset.';
+  return out;
+}
+
+// PATCH 2026-06-20-purge-stale: one-time cleanup of STALE unsent drafts. Rule (user, 2026-06-20):
+// any draft not sent within `daysOld` days of creation is deleted. arg1 = daysOld (default 5);
+// argS = 'execute' to delete (else DRY RUN — counts/categories/age-buckets only). The age filter is
+// a HARD safety boundary: anything newer than the cutoff (e.g. today's fresh cold drafts + the just-
+// regenerated lead-addressed follow-ups) is KEPT untouched. Deletes are CAPPED + time-budgeted so the
+// run stays under the HTTP/script timeout; if `moreRemain` is true, re-call to continue. After the
+// final execute, run menuRunDraftSyncerNow to reconcile the deleted-draft leads → DRAFT_DELETED
+// (the @237-correct syncer; no false-positives). Deleting an unsent draft never touches sent mail.
+function menuPurgeStaleUnsentDrafts(daysOld, doFix) {
+  var DAYS = parseInt(daysOld, 10);
+  if (!DAYS || DAYS < 1) DAYS = 5;                       // the 5-day rule (default)
+  var execute = (String(doFix).toLowerCase() === 'execute');
+  var now = new Date();
+  var cutoffMs = now.getTime() - DAYS * 86400000;
+  var owner = '';
+  try { owner = (Session.getEffectiveUser().getEmail() || '').toLowerCase(); } catch (_) {}
+
+  var drafts;
+  try { drafts = GmailApp.getDrafts(); } catch (e) { return { status: 'error', error: 'getDrafts failed: ' + e.message }; }
+
+  var START = now.getTime();
+  var TIME_BUDGET_MS = 150000;                           // ~2.5 min — return before timeout
+  var MAX_DELETE = 100;                                  // per-call delete cap (resumable)
+
+  var out = {
+    status: 'ok', mode: execute ? 'execute' : 'dryrun', daysOld: DAYS,
+    cutoff: Utilities.formatDate(new Date(cutoffMs), 'Asia/Kolkata', 'yyyy-MM-dd HH:mm'),
+    totalDrafts: drafts.length, staleCandidates: 0, deleted: 0,
+    byCategory: { cold: 0, reply: 0, selfOrOther: 0 }, ageBuckets: {}, samples: [], moreRemain: false
+  };
+
+  for (var i = 0; i < drafts.length; i++) {
+    if (execute && (out.deleted >= MAX_DELETE || (new Date().getTime() - START) > TIME_BUDGET_MS)) {
+      out.moreRemain = true; break;
+    }
+    var msg;
+    try { msg = drafts[i].getMessage(); } catch (e) { continue; }
+    var dt;
+    try { dt = msg.getDate(); } catch (e) { continue; }
+    if (!dt || dt.getTime() >= cutoffMs) continue;       // newer than cutoff → KEEP (hard safety boundary)
+
+    out.staleCandidates++;
+    var subj = '', to = '';
+    try { subj = (msg.getSubject() || '').trim(); } catch (_) {}
+    try { to = (msg.getTo() || ''); } catch (_) {}
+    var toLc = to.toLowerCase();
+
+    var cat = 'cold';
+    if (/^re:/i.test(subj)) cat = 'reply';
+    if (owner && toLc.indexOf(owner) >= 0) cat = 'selfOrOther';
+    out.byCategory[cat]++;
+
+    var ageDays = Math.floor((now.getTime() - dt.getTime()) / 86400000);
+    var bk = ageDays >= 30 ? 'd30plus' : (ageDays >= 14 ? 'd14_29' : (ageDays >= 7 ? 'd7_13' : 'd5_6'));
+    out.ageBuckets[bk] = (out.ageBuckets[bk] || 0) + 1;
+
+    if (out.samples.length < 20) {
+      out.samples.push({
+        date: Utilities.formatDate(dt, 'Asia/Kolkata', 'yyyy-MM-dd'),
+        ageDays: ageDays, cat: cat, to: to.substring(0, 36), subject: subj.substring(0, 40)
+      });
+    }
+
+    if (execute) {
+      try { drafts[i].deleteDraft(); out.deleted++; } catch (_) {}
+    }
+  }
+
+  out.note = execute
+    ? ('Deleted ' + out.deleted + ' stale (>=' + DAYS + 'd) unsent drafts this run' +
+       (out.moreRemain ? ' — MORE REMAIN (cap/budget hit), re-run argS=execute to continue.'
+                       : '. No more remain at this threshold.') +
+       ' Then run menuRunDraftSyncerNow to reconcile leads -> DRAFT_DELETED.')
+    : ('DRY RUN — ' + out.staleCandidates + ' stale unsent drafts (>=' + DAYS + 'd old, created on/before ' +
+       out.cutoff + '). Re-call with argS=execute to delete (capped + resumable).');
+  return out;
+}
+
+// PATCH 2026-06-20-leadphones: compile the ONLY legitimately-owned phone numbers into a 'LeadPhones'
+// data sheet. Two free + consented sources:
+//   A (apk_capture)    — Sheet1 col H: phones the APK scraped from 1st-degree LinkedIn connections
+//                        (visible + opt-in). STRANDED there: UNIQUE(Sheet1!B2:G) omits col H, so the
+//                        pipeline never sees them. We surface them.
+//   B (reply_signature)— leads who REPLIED to outreach; a number in their reply signature is consented
+//                        contact. We scan sent-ish leads' threads for the lead's OWN inbound message and
+//                        pull the phone from the NEW reply text only (quoted original is stripped, so our
+//                        own signature can't leak in).
+// arg1=1 → (re)write the 'LeadPhones' sheet; arg1=0/empty → DRY RUN (counts + samples, no write).
+function menuCompileLeadPhones(arg1) {
+  var doWrite = (String(arg1) === '1' || arg1 === 1);
+  var owner = '';
+  try { owner = (Session.getEffectiveUser().getEmail() || '').toLowerCase(); } catch (_) {}
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var out = { status: 'ok', mode: doWrite ? 'write' : 'dryrun',
+              captured: 0, replySigned: 0, threadsScanned: 0, unique: 0, wrote: false, samples: [] };
+
+  // ── Source A: captured phones stranded in Sheet1 col H ──
+  var captured = [];
+  var s1 = ss.getSheetByName('Sheet1');
+  if (s1) {
+    var d1 = s1.getDataRange().getValues();
+    for (var i = 1; i < d1.length; i++) {
+      var rawPh = (d1[i][7] || '').toString();             // H Phone
+      var ph = _phNormalizeIndian_(rawPh);
+      if (!ph) continue;
+      var em1 = (d1[i][6] || '').toString().trim();        // G Email
+      var nm1 = (d1[i][2] || '').toString().trim();        // C Full_Name
+      if (_phIsTestLead_(em1, nm1)) continue;              // drop E2E/diagnostic test rows
+      captured.push({
+        name: nm1, org: (d1[i][5] || '').toString().trim(),     // F Organization
+        designation: (d1[i][4] || '').toString().trim(),        // E Designation
+        email: em1, url: (d1[i][1] || '').toString().trim(),    // B LinkedIn_URL
+        phone: ph, type: _phType_(rawPh), source: 'apk_capture',
+        detail: 'conn=' + ((d1[i][10] || '').toString().trim() || '?')  // K Connection degree
+      });
+    }
+  }
+  out.captured = captured.length;
+
+  // ── Source B: reply-signature phones from sent-ish leads' threads ──
+  var replied = [];
+  var c = CONFIG.COLUMNS;
+  var SENTISH = { SENT: 1, FOLLOWUP_1: 1, FOLLOWUP_2: 1, FOLLOWUP_3: 1, RESPONDED: 1 };
+  var s2 = ss.getSheetByName(CONFIG.DATA_SHEET);
+  if (s2) {
+    var d2 = s2.getDataRange().getValues();
+    for (var j = 1; j < d2.length; j++) {
+      var st = (d2[j][c.STATUS - 1] || '').toString().trim();
+      if (!SENTISH[st]) continue;
+      var threadId = (d2[j][c.THREAD_ID - 1] || '').toString().trim();
+      var leadEmail = ((d2[j][c.ENRICHED_EMAIL - 1] || d2[j][c.EMAIL - 1] || '') + '').trim().toLowerCase();
+      if (!threadId || !leadEmail) continue;
+      out.threadsScanned++;
+      try {
+        var th = GmailApp.getThreadById(threadId);
+        if (!th) continue;
+        var msgs = th.getMessages(), foundPhone = '';
+        for (var m = 0; m < msgs.length; m++) {
+          var from = (msgs[m].getFrom() || '').toLowerCase();
+          if (from.indexOf(owner) >= 0) continue;        // our own message
+          if (from.indexOf(leadEmail) < 0) continue;     // only the lead's inbound message
+          var ph2 = _phExtractFromReply_(msgs[m].getPlainBody() || '');
+          if (ph2) foundPhone = ph2;                     // keep most-recent reply's phone
+        }
+        if (foundPhone && !_phIsTestLead_(leadEmail, '')) {
+          replied.push({
+            name: (d2[j][c.FULL_NAME - 1] || '').toString().trim(),
+            org: (d2[j][c.ORGANIZATION - 1] || '').toString().trim(),
+            designation: (d2[j][c.DESIGNATION - 1] || '').toString().trim(),
+            email: leadEmail, url: (d2[j][c.LINKEDIN_URL - 1] || '').toString().trim(),
+            phone: foundPhone, type: 'mobile_IN', source: 'reply_signature', detail: 'from reply'
+          });
+        }
+      } catch (e) {}
+    }
+  }
+  out.replySigned = replied.length;
+
+  // ── Merge + dedup by lead (prefer reply_signature: actively shared = most current) ──
+  var byKey = {};
+  captured.concat(replied).forEach(function (r) {
+    var key = (r.email || r.url || (r.name + '|' + r.phone)).toLowerCase();
+    if (!byKey[key] || r.source === 'reply_signature') byKey[key] = r;
+  });
+  var rows = Object.keys(byKey).map(function (k) { return byKey[k]; });
+  out.unique = rows.length;
+  out.byType = {};
+  rows.forEach(function (r) { out.byType[r.type || 'other'] = (out.byType[r.type || 'other'] || 0) + 1; });
+  out.realMobiles = (out.byType['mobile_IN'] || 0);   // the only directly-useful personal numbers
+  out.samples = rows.slice(0, 15).map(function (r) {
+    return { name: r.name, org: r.org, phone: r.phone, type: r.type, source: r.source };
+  });
+
+  // ── Write the data sheet ──
+  if (doWrite) {
+    var sh = ss.getSheetByName('LeadPhones') || ss.insertSheet('LeadPhones');
+    sh.clear();
+    var headers = ['Name', 'Organization', 'Designation', 'Email', 'LinkedIn_URL', 'Phone', 'Type', 'Source', 'Detail'];
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    if (rows.length) {
+      var data = rows.map(function (r) {
+        return [r.name, r.org, r.designation, r.email, r.url, r.phone, r.type, r.source, r.detail];
+      });
+      sh.getRange(2, 1, data.length, headers.length).setValues(data);
+    }
+    sh.setFrozenRows(1);
+    out.wrote = true;
+    out.sheet = 'LeadPhones';
+    try { out.url = ss.getUrl() + '#gid=' + sh.getSheetId(); } catch (_) {}
+  }
+  return out;
+}
+
+// Normalize/validate a phone string. Returns a clean '+91 XXXXX XXXXX' for Indian mobiles,
+// the original string for plausible landline/intl (10-13 digits), '' for junk / our '[VERIFY]' placeholder.
+function _phNormalizeIndian_(raw) {
+  if (!raw) return '';
+  var s = raw.toString().trim();
+  if (!s || /verify/i.test(s)) return '';                 // skip our own '+91-[VERIFY]' placeholder
+  var digits = s.replace(/[^\d]/g, '');
+  if (digits.length < 10) return '';
+  var d = digits;
+  if (d.length === 12 && d.slice(0, 2) === '91') d = d.slice(2);
+  if (d.length === 11 && d.charAt(0) === '0') d = d.slice(1);
+  if (d.length === 10 && /^[6-9]/.test(d)) return '+91 ' + d.slice(0, 5) + ' ' + d.slice(5);  // clean Indian mobile
+  if (digits.length >= 10 && digits.length <= 13) return s;  // landline / international — keep original
+  return '';
+}
+
+// Strip the quoted-original portion of a reply so we only parse the lead's NEW text (their signature),
+// never our own quoted cold-email signature.
+function _phTopReplyText_(body) {
+  if (!body) return '';
+  var cut = body.search(/\n\s*On .+ wrote:|\n\s*From:\s|\n-{2,}\s*Original Message|\n_{5,}|\n>{1,}/);
+  return (cut > 0) ? body.substring(0, cut) : body;
+}
+
+// Extract an Indian mobile from a reply's top text (signature = last match at the bottom).
+function _phExtractFromReply_(body) {
+  var top = _phTopReplyText_(body);
+  if (!top) return '';
+  // [6-9] then 9 more digits, each optionally preceded by a space/dash — matches 98765 43210,
+  // 987-654-3210, 9876543210 alike (the old 3-3-4-only pattern missed the common 5-5 grouping).
+  var re = /(?:\+?\s*91[\s-]?|\b0)?([6-9](?:[\s-]?\d){9})\b/g;
+  var matches = [], m;
+  while ((m = re.exec(top)) !== null) {
+    var dg = m[1].replace(/[^\d]/g, '');
+    if (dg.length === 10 && /^[6-9]/.test(dg)) matches.push('+91 ' + dg.slice(0, 5) + ' ' + dg.slice(5));
+  }
+  return matches.length ? matches[matches.length - 1] : '';   // signature sits at the bottom
+}
+
+// Classify a phone so the data sheet shows WHAT each number is (only mobile_IN is a directly-useful
+// personal line; the rest are company/landline/intl switchboards).
+function _phType_(raw) {
+  var digits = (raw || '').toString().replace(/[^\d]/g, '');
+  var d = digits;
+  if (d.length === 12 && d.slice(0, 2) === '91') d = d.slice(2);
+  if (d.length === 11 && d.charAt(0) === '0') d = d.slice(1);
+  if (d.length === 10 && /^[6-9]/.test(d)) return 'mobile_IN';     // Indian mobile = personal
+  if (d.length === 10 && /^[2-5]/.test(d)) return 'landline_IN';   // Indian landline / office (STD 2-5)
+  if (digits.charAt(0) === '1' && digits.length === 11) return 'intl_US';
+  return 'company_or_intl';
+}
+
+// Drop E2E/diagnostic test artifacts (RFC-reserved .example emails, automail test markers) so the
+// data sheet holds only real leads.
+function _phIsTestLead_(email, name) {
+  var e = (email || '').toString().toLowerCase(), n = (name || '').toString().toLowerCase();
+  var domain = (e.split('@')[1] || '');
+  if (/\.example$/.test(domain)) return true;                      // RFC 2606 reserved — never a real lead
+  if (/do-not-process|automail-(e2e|test)|@e2e-|testco-|e2e-test/.test(e)) return true;
+  if (/\be2e\b|diag full name|do not process/.test(n)) return true;
+  return false;
+}
+
+// PATCH 2026-06-20-leaddiag: read-only deep lookup of a lead by (partial) name across BOTH sheets.
+// Returns Sheet1 (raw APK capture) AND Sheet2 (pipeline state) side-by-side so we can tell a CAPTURE
+// bug (APK grabbed the wrong org) from a PROCESSING bug (pipeline changed it), and read the exact
+// enrichment audit trail (enrichedEmail / emailSource / notes) behind a wrong or blank email.
+function menuDiagnoseLeadByName(argS) {
+  var q = (argS || '').toString().trim().toLowerCase();
+  if (!q) return { status: 'error', error: 'pass a name via argS' };
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var c = CONFIG.COLUMNS;
+  var out = { status: 'ok', query: q, sheet2: [], sheet1: [] };
+
+  var s2 = ss.getSheetByName(CONFIG.DATA_SHEET);
+  if (s2) {
+    var d2 = s2.getDataRange().getValues();
+    for (var i = 1; i < d2.length; i++) {
+      if ((d2[i][c.FULL_NAME - 1] || '').toString().toLowerCase().indexOf(q) < 0) continue;
+      out.sheet2.push({
+        row: i + 1,
+        name: (d2[i][c.FULL_NAME - 1] || '').toString(),
+        headline: (d2[i][c.HEADLINE - 1] || '').toString(),
+        designation: (d2[i][c.DESIGNATION - 1] || '').toString(),
+        organization: (d2[i][c.ORGANIZATION - 1] || '').toString(),
+        apkEmail: (d2[i][c.EMAIL - 1] || '').toString(),
+        status: (d2[i][c.STATUS - 1] || '').toString(),
+        enrichedEmail: (d2[i][c.ENRICHED_EMAIL - 1] || '').toString(),
+        emailSource: (d2[i][c.EMAIL_SOURCE - 1] || '').toString(),
+        emailConfidence: (d2[i][c.EMAIL_CONFIDENCE - 1] || '').toString(),
+        notes: (d2[i][c.NOTES - 1] || '').toString().substring(0, 600),
+        url: (d2[i][c.LINKEDIN_URL - 1] || '').toString()
+      });
+    }
+  }
+
+  var s1 = ss.getSheetByName('Sheet1');
+  if (s1) {
+    var d1 = s1.getDataRange().getValues();
+    for (var j = 1; j < d1.length; j++) {
+      if ((d1[j][2] || '').toString().toLowerCase().indexOf(q) < 0) continue;   // C Full_Name
+      out.sheet1.push({
+        row: j + 1,
+        timestamp: d1[j][0] ? d1[j][0].toString() : '',
+        url: (d1[j][1] || '').toString(), name: (d1[j][2] || '').toString(),
+        headline: (d1[j][3] || '').toString(), designation: (d1[j][4] || '').toString(),
+        organization: (d1[j][5] || '').toString(), email: (d1[j][6] || '').toString(),
+        phone: (d1[j][7] || '').toString(), connection: (d1[j][10] || '').toString(),
+        confidence: (d1[j][11] || '').toString()
+      });
+    }
+  }
+  return out;
+}
+
+// ─── VENDOR ACCOUNT + BREAKER DIAGNOSTIC (-p5-vendorfailover) ───────────────
+//
+// menuCheckVendorAccounts: READ-ONLY. Answers "which mail ID is the key linked
+// to + how many credits are left" by calling Hunter's /v2/account (returns the
+// account login email + plan + remaining credits) and Apollo's /v1/auth/health
+// (validates the key WITHOUT consuming a credit), using the SERVER's
+// ScriptProperty keys — then snapshots the VendorHealth circuit so you can see
+// which vendor the failover is currently skipping. Full key is never returned —
+// only the last-4 tail. Use after a top-up to confirm the right account refilled.
+function menuCheckVendorAccounts() {
+  var props = PropertiesService.getScriptProperties();
+  var out = {
+    hunter: {}, apollo: {}, breakers: {},
+    killSwitch: (props.getProperty('VENDOR_FAILOVER_ENABLED') === '0') ? 'OFF (vendor skipping disabled)' : 'ON (failover active)'
+  };
+
+  var hk = props.getProperty('HUNTER_API_KEY');
+  if (hk) {
+    try {
+      var hr = UrlFetchApp.fetch('https://api.hunter.io/v2/account?api_key=' + encodeURIComponent(hk),
+                                 { muteHttpExceptions: true });
+      var hcode = hr.getResponseCode();
+      var hj = {};
+      try { hj = JSON.parse(hr.getContentText()); } catch (_) {}
+      var keyTail = hk.length > 4 ? ('…' + hk.substring(hk.length - 4)) : '(short)';
+      if (hcode === 200 && hj && hj.data) {
+        var sr = (hj.data.requests && hj.data.requests.searches) || {};
+        out.hunter = {
+          httpCode: hcode, keyTail: keyTail,
+          accountEmail: hj.data.email || '',
+          plan: hj.data.plan_name || '',
+          resetDate: hj.data.reset_date || '',
+          searchesUsed: (typeof sr.used === 'number') ? sr.used : null,
+          searchesAvailable: (typeof sr.available === 'number') ? sr.available : null,
+          searchesRemaining: (typeof sr.available === 'number' && typeof sr.used === 'number') ? (sr.available - sr.used) : null
+        };
+      } else {
+        out.hunter = { httpCode: hcode, keyTail: keyTail, error: (hr.getContentText() || '').substring(0, 200) };
+      }
+    } catch (e) { out.hunter = { error: e.message }; }
+  } else { out.hunter = { error: 'HUNTER_API_KEY not set in ScriptProperties' }; }
+
+  var ak = props.getProperty('APOLLO_API_KEY');
+  if (ak) {
+    try {
+      var ar = UrlFetchApp.fetch('https://api.apollo.io/api/v1/auth/health',
+                                 { method: 'get', headers: { 'X-Api-Key': ak }, muteHttpExceptions: true });
+      out.apollo = {
+        httpCode: ar.getResponseCode(),
+        body: (ar.getContentText() || '').substring(0, 160),
+        keyTail: ak.length > 4 ? ('…' + ak.substring(ak.length - 4)) : '(short)',
+        hasFallbackKey: !!props.getProperty('APOLLO_API_KEY_FALLBACK')
+      };
+    } catch (e) { out.apollo = { error: e.message }; }
+  } else { out.apollo = { error: 'APOLLO_API_KEY not set in ScriptProperties' }; }
+
+  try {
+    var snap = (typeof vendorHealthSnapshot === 'function') ? vendorHealthSnapshot() : { providers: {} };
+    out.breakers = snap.providers || {};
+  } catch (e) { out.breakers = { error: e.message }; }
+
+  Logger.log('[menuCheckVendorAccounts] ' + JSON.stringify(out, null, 2));
+  return out;
+}
+
+// menuResetVendorBreaker(provider): manual circuit reset after a top-up, so the
+// cascade resumes calling the vendor immediately instead of waiting for the
+// cool-down probe. Pass the provider as argS (e.g. &argS=apollo). The
+// vendorHealth property is self-locked (LockService) inside VendorHealth.gs.
+function menuResetVendorBreaker(provider) {
+  provider = (provider || '').toString().toLowerCase().trim();
+  if (!provider) return { status: 'error', error: 'provider required (apollo|hunter|reoon|claude|gemini)' };
+  if (typeof vendorHealthResetProvider !== 'function') return { status: 'error', error: 'VendorHealth.gs not deployed' };
+  var res = vendorHealthResetProvider(provider);
+  Logger.log('[menuResetVendorBreaker] ' + provider + ' reset → ' + JSON.stringify(res));
+  return { status: 'ok', provider: provider, result: res };
+}
+
+// ─── ACCURACY LEDGER (-p6-accuracy-ledger) ─────────────────────────────────
+//
+// The ground-truth feedback loop the pipeline has lacked: it joins each lead's
+// OUTCOME (STATUS col G) to the SOURCE that produced its email (EMAIL_SOURCE
+// col Y) + the deliverability confidence band (EMAIL_CONFIDENCE col Z), and
+// aggregates the sent / replied / bounced / deleted labels you ALREADY generate
+// into per-source and per-confidence-band accuracy rates. Read-only. This is
+// what tells us which sources are actually accurate vs which only LOOK
+// confident — i.e. where the real dramatic gains are, instead of guessing.
+//
+// Pure helpers extracted so the bucket + rate math is unit-testable.
+
+// Map a STATUS string to an outcome bucket.
+function _ledgerBucketOf_(status) {
+  var s = (status || '').toString().toUpperCase();
+  if (s === 'RESPONDED' || s === 'REPLIED') return 'replied';      // strongest positive
+  if (s.indexOf('BOUNCED') === 0) return 'bounced';                // hard negative (BOUNCED_<cat>)
+  if (s === 'DRAFT_DELETED') return 'deleted';                     // human rejected the draft
+  if (s === 'SENT' || s.indexOf('FOLLOWUP_') === 0) return 'sent'; // you approved + it went out
+  if (s === 'DRAFT_CREATED' || s === 'DRAFT_STALE' || s === 'DRAFT_ABANDONED') return 'drafted'; // in-flight
+  return 'other';                                                  // pre-draft / error — excluded from rates
+}
+
+// Confidence (col Z, 0-1) → band label aligned to the finalizer tiers.
+function _ledgerConfBand_(z) {
+  var v = parseFloat(z);
+  if (isNaN(v)) return '(none)';
+  if (v >= 0.85) return '0.85+';
+  if (v >= 0.55) return '0.55-0.84';
+  if (v >= 0.35) return '0.35-0.54';
+  if (v >= 0.20) return '0.20-0.34';
+  return '<0.20';
+}
+
+// Counts {sent,replied,bounced,deleted,...} → rates.
+//   mailed     = went out (sent + replied + bounced); a replied/bounced row WAS sent.
+//   bounceRate = bounced / mailed   (deliverability — the accuracy signal)
+//   replyRate  = replied / mailed   (engagement / right-person signal)
+//   deleteRate = deleted / (mailed + deleted)  (your manual reject rate on reviewed drafts)
+function _ledgerRates_(o) {
+  o = o || {};
+  var sent = o.sent || 0, replied = o.replied || 0, bounced = o.bounced || 0, deleted = o.deleted || 0;
+  var mailed = sent + replied + bounced;
+  var reviewed = mailed + deleted;
+  return {
+    counts: o,
+    mailed: mailed,
+    bounceRate: mailed > 0 ? +(bounced / mailed).toFixed(3) : null,
+    replyRate:  mailed > 0 ? +(replied / mailed).toFixed(3) : null,
+    deleteRate: reviewed > 0 ? +(deleted / reviewed).toFixed(3) : null
+  };
+}
+
+function menuAccuracyLedger(daysWindow) {
+  var win = parseInt(daysWindow, 10);
+  if (isNaN(win) || win < 0) win = 0;                       // 0 / blank = all-time
+  var cutoffMs = win > 0 ? (Date.now() - win * 86400000) : 0;
+
+  var ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  var sheet = ss.getSheetByName(CONFIG.DATA_SHEET);
+  if (!sheet) return { status: 'error', error: 'data sheet not found: ' + CONFIG.DATA_SHEET };
+  var c = CONFIG.COLUMNS;
+  var data = sheet.getDataRange().getValues();
+
+  function fam(src) {
+    return (typeof _eq2GroupSourcePrefix === 'function')
+      ? _eq2GroupSourcePrefix(src) : ((src || '<empty>').toString());
+  }
+  function blank() { return { sent: 0, replied: 0, bounced: 0, deleted: 0, drafted: 0, other: 0 }; }
+
+  var bySource = {}, byBand = {}, byVerify = { verify_flagged: blank(), clean: blank() };
+  var totals = blank(); var rowsCounted = 0;
+
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var status = row[c.STATUS - 1];
+    if (!status) continue;
+    if (cutoffMs) {
+      var lu = row[c.LAST_UPDATED - 1];
+      var luMs = lu ? new Date(lu).getTime() : 0;
+      if (luMs && luMs < cutoffMs) continue;
+    }
+    var b = _ledgerBucketOf_(status);
+    totals[b]++; rowsCounted++;
+    var f = fam(row[c.EMAIL_SOURCE - 1]);
+    if (!bySource[f]) bySource[f] = blank();
+    bySource[f][b]++;
+    var bd = _ledgerConfBand_(row[c.EMAIL_CONFIDENCE - 1]);
+    if (!byBand[bd]) byBand[bd] = blank();
+    byBand[bd][b]++;
+    // [VERIFY] risk-flag cut: does flagging actually predict bounces? (validates the flag)
+    var flagged = (row[c.SUBJECT_LINE - 1] || '').toString().indexOf('VERIFY') >= 0 ||
+                  (row[c.NOTES - 1] || '').toString().indexOf('[VERIFY') >= 0;
+    byVerify[flagged ? 'verify_flagged' : 'clean'][b]++;
+  }
+
+  function mapRates(obj) { var o = {}; Object.keys(obj).forEach(function(k){ o[k] = _ledgerRates_(obj[k]); }); return o; }
+
+  // Worst-first: sources with >=3 mailed, ranked by bounceRate desc — the weak links.
+  var ranked = Object.keys(bySource).map(function(k){ return { source: k, r: _ledgerRates_(bySource[k]) }; })
+    .filter(function(x){ return x.r.mailed >= 3; })
+    .sort(function(a, b){ return (b.r.bounceRate || 0) - (a.r.bounceRate || 0); })
+    .map(function(x){ return { source: x.source, mailed: x.r.mailed, bounceRate: x.r.bounceRate,
+                               replyRate: x.r.replyRate, deleteRate: x.r.deleteRate, counts: x.r.counts }; });
+
+  var result = {
+    windowDays: win || 'all', rowsCounted: rowsCounted, totals: totals,
+    worstSourcesByBounce: ranked,
+    bySource: mapRates(bySource),
+    byConfidenceBand: mapRates(byBand),
+    byVerifyFlag: mapRates(byVerify),
+    legend: 'bounceRate/replyRate = of MAILED (sent+replied+bounced). deleteRate = deleted/(mailed+deleted) = your manual reject rate. drafted=in-flight (excluded). other=pre-draft/error (excluded). worstSourcesByBounce omits sources with <3 mailed (noise).'
+  };
+  Logger.log('[menuAccuracyLedger] ' + JSON.stringify(result, null, 2));
+  return result;
 }

@@ -279,7 +279,11 @@ var HUMAN_DECIDED_STATUSES = {
   'SENT': true,
   'BOUNCED_HARD': true,
   'BOUNCED_SOFT': true,
-  'DRAFT_CREATED': true
+  'DRAFT_CREATED': true,
+  // PATCH 2026-06-17-verify-email-hold: a low-confidence guess parked for human
+  // verification. NOT in STUCK_AUTO_RECOVER_STATUSES — it must NOT auto-reprocess
+  // (that would re-guess + re-hold in a loop). Promote via menuPromoteEmailVerify.
+  'VERIFY_EMAIL': true
 };
 
 /**
@@ -365,6 +369,38 @@ function _findCanonicalLeadRow(data, cols, candidateRowNum, candidateEmail, cand
   }
 
   return null;
+}
+
+// ── DEDUP CORRECTION-PATH (2026-06-24-dedup-correction) ─────────────────────
+// A re-scan whose ORG materially CONFLICTS with an ACTIVE (re-draftable) canonical row is a
+// CORRECTION, not a redundant duplicate. (Live: "Manpreet Kaur" — old row captured a stale
+// "Zomato" org+email; the re-scan in the new app correctly read "boAt", but the identity-only
+// dedup discarded the corrected row and kept the stale Zomato draft.) This PURE predicate
+// decides eligibility; the caller applies the fix via menuFixEmployerAndPromote (org override +
+// engine email re-derive). It NEVER corrects a terminal / human-killed canonical
+// (DRAFT_DELETED / DRAFT_ABANDONED / SENT / REPLIED / BOUNCED_*) — honoring the dedup's original
+// contract: don't resurrect a lead the user deliberately closed. Material conflict only — a
+// same/overlapping org is a true redundant duplicate (no correction).
+var _DEDUP_REDRAFTABLE_STATUSES = {
+  'NEW': 1, 'CLASSIFYING': 1, 'RESEARCH_DONE': 1, 'NEEDS_EMAIL': 1, 'NEEDS_EMAIL_REVIEW': 1,
+  'NEEDS_REVIEW': 1, 'VERIFY_EMAIL': 1, 'DRAFT_CREATED': 1
+};
+function _dedupShouldCorrect_(canonicalStatus, candidateOrg, canonicalOrg, canonicalOrgOverride) {
+  var cs = (canonicalStatus || '').toString().trim();
+  if (!_DEDUP_REDRAFTABLE_STATUSES[cs]) return false;   // honor terminal / human-killed states
+  var co = (candidateOrg || '').toString().trim();
+  if (!co) return false;                                 // no corrected org to propagate
+  if (typeof _looksLikeNonCompanyOrg === 'function' && _looksLikeNonCompanyOrg(co)) return false; // never propagate a junk/tagline org
+  // ★IDEMPOTENCY (2026-06-24): if the canonical is ALREADY org-overridden to this employer, the
+  // correction was already applied — do NOT re-fire. menuFixEmployerAndPromote sets the org in a
+  // ScriptProperty OVERRIDE; the Sheet2 org CELL is a UNIQUE spill that NEVER updates, so the
+  // cell-vs-candidate conflict is PERMANENT. Without this guard the correction re-fires every
+  // scan → re-draft loop (observed live on Manpreet: 2+ drafts, status oscillating NEW↔DRAFT).
+  var ov = (canonicalOrgOverride || '').toString().trim();
+  if (ov && typeof _normCompanyName === 'function' &&
+      _normCompanyName(ov) === _normCompanyName(co)) return false;
+  if (typeof _companiesConflict !== 'function') return false;
+  return _companiesConflict(co, (canonicalOrg || '').toString().trim());  // material conflict ⇒ correction
 }
 
 // ─── LAYER 2 — DISPATCHER ───────────────────────────────────────────────────
@@ -871,9 +907,41 @@ function scanAndDispatch(opts) {
           var sheet2 = ss2.getSheetByName(CONFIG.DATA_SHEET);
           if (sheet2) {
             var canonInfo = newDecision.reason || '';
+            // ── DEDUP CORRECTION-PATH (2026-06-24): if this re-scan's org CONFLICTS with an
+            //    ACTIVE canonical, it's a CORRECTION — propagate the corrected employer to the
+            //    canonical (org override + engine email re-derive) instead of discarding the
+            //    corrected scan and keeping the stale draft. Honors terminal/human-killed
+            //    canonicals (see _dedupShouldCorrect_). The dup row is still parked as DUPLICATE
+            //    (it delivered the correction); the canonical re-drafts on the next scan.
+            var _dupCorrected = false, _dupOldOrg = '', _dupNewOrg = '';
+            try {
+              var _cm = canonInfo.match(/row_(\d+):(.+)$/);
+              if (_cm) {
+                var _canonRow = parseInt(_cm[1], 10);
+                var _canonStatus = (_cm[2] || '').trim();
+                var _candOrg = (row[cols.ORGANIZATION - 1] || '').toString().trim();
+                var _canonOrg = (sheet2.getRange(_canonRow, cols.ORGANIZATION).getValue() || '').toString().trim();
+                // Pass the canonical's existing org override so the correction is ONE-SHOT
+                // (the Sheet2 org cell is a UNIQUE spill that never updates — without this the
+                // correction would re-fire every scan → re-draft loop).
+                var _canonOv = (typeof _orgOverrideGet_ === 'function') ? _orgOverrideGet_(_canonRow) : '';
+                if (_dedupShouldCorrect_(_canonStatus, _candOrg, _canonOrg, _canonOv) &&
+                    typeof menuFixEmployerAndPromote === 'function') {
+                  menuFixEmployerAndPromote(_canonRow, _candOrg);   // org override + clear stale email + re-derive + status NEW
+                  _dupCorrected = true; _dupOldOrg = _canonOrg; _dupNewOrg = _candOrg;
+                  Logger.log('[Scanner] DEDUP_CORRECTION canonical row ' + _canonRow +
+                             ' org "' + _canonOrg + '" → "' + _candOrg + '" (re-scan correction)');
+                }
+              }
+            } catch (_corrErr) {
+              Logger.log('[Scanner] dedup correction failed: ' + _corrErr.message);
+            }
             var existingNotes = (sheet2.getRange(rowNum, cols.NOTES).getValue() || '').toString();
-            var dupNote = '[DUPLICATE_LEAD] canonical ' + canonInfo +
-                          '; user decision honored. ' + new Date().toISOString();
+            var dupNote = _dupCorrected
+              ? '[DUPLICATE_LEAD] canonical ' + canonInfo + '; CORRECTED canonical org "' +
+                _dupOldOrg + '" → "' + _dupNewOrg + '" + re-derive (re-scan correction). ' + new Date().toISOString()
+              : '[DUPLICATE_LEAD] canonical ' + canonInfo +
+                '; user decision honored. ' + new Date().toISOString();
             var newNotes = (existingNotes + ' | ' + dupNote).substring(0, 1900);
             sheet2.getRange(rowNum, cols.STATUS).setValue('DUPLICATE');
             sheet2.getRange(rowNum, cols.NOTES).setValue(newNotes);
